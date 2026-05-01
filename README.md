@@ -1,417 +1,566 @@
-# Complete Dynamic Catalog Implementation Code & Setup Guide
+# Quick Review Popup — Implementation Guide
 
-This document contains **all the necessary code** for the Location-Aware Product Catalog feature, combined into a single place. Follow these step-by-step instructions to implement the code in your local codebase.
+## Feature Summary
 
----
-
-## Prerequisites & Installation
-
-Before writing the code, ensure the background dependencies are installed in your backend service. Open your terminal in the backend folder and run:
-
-```bash
-cd d:\Sarvm\backend\catalogue_mgmt_service
-npm install @google/genai axios
-```
-*(Note: `node-cron` is already in your `package.json` so it will be available).*
+When a retailer opens the **Pending** tab in My Catalog and there are pending products, a full-screen modal automatically appears asking **"Are You Selling This?"** for each product. The retailer taps **Yes** (move to Unavailable) or **No** (remove from catalog), and the next product loads instantly. **No API call is made until the user closes the popup or finishes all products**, at which point a single batched call is made. This saves significant time compared to the current one-by-one flow.
 
 ---
 
-## BACKEND CODE (catalogue_mgmt_service)
+## Files Changed
 
-### 1. AI Product Trends Schema
-**Create File:** `d:\Sarvm\backend\catalogue_mgmt_service\src\apis\models\mongoCatalog\aiProductTrendsSchema.js`
+| File | Action |
+|------|--------|
+| `frontend/retailer_app/src/app/pages/catelog/my-catalog/my-catalog.component.ts` | **MODIFY** — Add Quick Review logic |
+| `frontend/retailer_app/src/app/pages/catelog/my-catalog/my-catalog.component.html` | **MODIFY** — Add Quick Review modal HTML |
+| `frontend/retailer_app/src/app/pages/catelog/my-catalog/my-catalog.component.scss` | **MODIFY** — Add Quick Review modal styles |
 
-```javascript
-// src/apis/models/mongoCatalog/aiProductTrendsSchema.js
-const mongoose = require('mongoose');
-const Schema = mongoose.Schema;
+> [!NOTE]
+> **No new files need to be created.** All changes are additions to existing files.  
+> **No backend changes are required.** The existing `insertCatalogData` and `updateCatalogData` APIs already support batched products and removed products.
 
-const aiProductTrendsSchema = new Schema({
-    zipcode: { type: String, required: true },
-    city: { type: String },
-    state: { type: String },
-    category: { type: String, required: true },
-    products: [{ type: String }], // Array of AI suggested product names
-    lastUpdated: { type: Date, default: Date.now }
-});
+---
 
-// Ensure we don't duplicate trend requests for a specific zip + category
-aiProductTrendsSchema.index({ zipcode: 1, category: 1 }, { unique: true });
+## Step 1 — TypeScript Changes
 
-module.exports = mongoose.model('AiProductTrends', aiProductTrendsSchema);
+**File:** `frontend/retailer_app/src/app/pages/catelog/my-catalog/my-catalog.component.ts`
+
+### 1A. Add new properties
+
+Find the line (around line 55):
+
+```typescript
+pendingOrUnpublishedProducts: Set<number> = new Set();
 ```
 
-### 2. Area Product Insights Schema
-**Create File:** `d:\Sarvm\backend\catalogue_mgmt_service\src\apis\models\mongoCatalog\areaProductInsightsSchema.js`
+**Add the following lines BELOW it:**
 
-```javascript
-// src/apis/models/mongoCatalog/areaProductInsightsSchema.js
-const mongoose = require('mongoose');
-const Schema = mongoose.Schema;
-
-const areaProductInsightsSchema = new Schema({
-    zipcode: { type: String, required: true },
-    city: { type: String },
-    state: { type: String },
-    category: { type: String, required: true },
-    rankedProducts: [{
-        product_id: { type: String },
-        product_name: { type: String },
-        score: { type: Number },
-        source: { type: String, enum: ['REAL_DATA', 'AI_TREND', 'MIXED'] },
-        price_estimate: { type: Number, default: 0 }
-    }],
-    lastUpdated: { type: Date, default: Date.now }
-});
-
-// Efficient fetching at runtime
-areaProductInsightsSchema.index({ zipcode: 1, category: 1 }, { unique: true });
-areaProductInsightsSchema.index({ city: 1, category: 1 }); // fallback index
-
-module.exports = mongoose.model('AreaProductInsights', areaProductInsightsSchema);
+```typescript
+  // ── Quick Review Popup Properties ──
+  quickReviewOpen: boolean = false;
+  quickReviewProducts: any[] = [];
+  quickReviewIndex: number = 0;
+  quickReviewCurrentProduct: any = null;
+  quickReviewProductsToUnpublish: any[] = [];
+  quickReviewProductsToRemove: any[] = [];
+  quickReviewProcessing: boolean = false;
+  quickReviewJustClosed: boolean = false;
 ```
 
-### 3. Gemini AI Service Integration
-**Create File:** `d:\Sarvm\backend\catalogue_mgmt_service\src\apis\services\v1\mongoCatalog\geminiService.js`
+### 1B. Add auto-open trigger inside `segmentChanged()`
 
-```javascript
-// src/apis/services/v1/mongoCatalog/geminiService.js
-const { Logger: log } = require('sarvm-utility');
-const { GoogleGenerativeAI } = require('@google/genai');
+Find the `segmentChanged()` method (around line 548). At the **very end** of the method, just **before** the line `loading.dismiss();` (around line 569), add:
 
-// Use environment variable for API key (Add GEMINI_API_KEY to your .lcl.env)
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || 'FALLBACK_KEY_FOR_LOCAL_TEST');
+```typescript
+      // ── Auto-open Quick Review when Pending tab is selected ──
+      if (this.productStatus === 'pending' && this.filteredProducts.length > 0 && !this.quickReviewJustClosed) {
+        this.openQuickReview();
+      }
+      this.quickReviewJustClosed = false;
+```
 
-const fetchTrendsFromGemini = async (zipcode, city, category) => {
-    log.info({ info: `Fetching AI trends for zip: ${zipcode}, cat: ${category}` });
+So the end of `segmentChanged()` should look like:
 
-    // Local override if no actual key is configured yet
-    if (!process.env.GEMINI_API_KEY) {
-        log.info({ info: `Using Mock AI Data for local testing.` });
-        return [
-            "Aashirvaad Whole Wheat Atta", "Amul Pasteurized Butter", "Tata Salt",
-            "Maggi 2-Minute Noodles", "Surf Excel Easy Wash", "Brooke Bond Red Label Tea",
-            "Saffola Gold Cooking Oil", "Everest Garam Masala", "Colgate Strong Teeth"
-        ];
+```typescript
+    } else {
+      this.filteredProducts = [];
     }
+    // ── Auto-open Quick Review when Pending tab is selected ──
+    if (this.productStatus === 'pending' && this.filteredProducts.length > 0 && !this.quickReviewJustClosed) {
+      this.openQuickReview();
+    }
+    this.quickReviewJustClosed = false;
+    loading.dismiss();
+  }
+```
+
+### 1C. Add all Quick Review methods
+
+Add the following methods **at the end of the class**, just **before** the closing `}` of the class (before line 1065):
+
+```typescript
+  // ═══════════════════════════════════════════════════════
+  // QUICK REVIEW POPUP — Batch review pending products
+  // ═══════════════════════════════════════════════════════
+
+  /**
+   * Opens the Quick Review popup.
+   * Collects all currently filtered pending products and starts the review cycle.
+   */
+  openQuickReview(): void {
+    // Deep-clone pending products so local mutations don't affect the list until commit
+    this.quickReviewProducts = this.filteredProducts
+      .filter((p: any) => p.status === 'pending')
+      .map((p: any) => JSON.parse(JSON.stringify(p)));
+
+    if (this.quickReviewProducts.length === 0) {
+      return;
+    }
+
+    this.quickReviewIndex = 0;
+    this.quickReviewCurrentProduct = this.quickReviewProducts[this.quickReviewIndex];
+    this.quickReviewProductsToUnpublish = [];
+    this.quickReviewProductsToRemove = [];
+    this.quickReviewProcessing = false;
+    this.quickReviewOpen = true;
+  }
+
+  /**
+   * Returns the display counter string, e.g. "3/25"
+   */
+  getQuickReviewCounter(): string {
+    return `${this.quickReviewIndex + 1}/${this.quickReviewProducts.length}`;
+  }
+
+  /**
+   * YES — the retailer sells this product.
+   * Mark it for status change to 'unpublished' (Unavailable) and move to next.
+   */
+  onQuickReviewYes(): void {
+    if (!this.quickReviewCurrentProduct) return;
+
+    // Clone the product and set status to 'unpublished'
+    const product = { ...this.quickReviewCurrentProduct, status: 'unpublished' };
+    this.quickReviewProductsToUnpublish.push(product);
+
+    this.advanceQuickReview();
+  }
+
+  /**
+   * NO — the retailer does NOT sell this product.
+   * Mark it for removal from catalog and move to next.
+   */
+  onQuickReviewNo(): void {
+    if (!this.quickReviewCurrentProduct) return;
+
+    this.quickReviewProductsToRemove.push(this.quickReviewCurrentProduct);
+
+    this.advanceQuickReview();
+  }
+
+  /**
+   * Advances to the next product, or commits if all products are reviewed.
+   */
+  private advanceQuickReview(): void {
+    if (this.quickReviewIndex >= this.quickReviewProducts.length - 1) {
+      // All products reviewed — commit the batch
+      this.commitQuickReview();
+    } else {
+      this.quickReviewIndex++;
+      this.quickReviewCurrentProduct = this.quickReviewProducts[this.quickReviewIndex];
+    }
+  }
+
+  /**
+   * CLOSE (✕) — the retailer exits early.
+   * Commit whatever decisions have been made so far.
+   */
+  closeQuickReview(): void {
+    this.commitQuickReview();
+  }
+
+  /**
+   * Commits all accumulated Yes/No decisions in a single batched API call.
+   * - Products marked YES → updateCatalogData (status changed to 'unpublished')
+   * - Products marked NO  → insertCatalogData  (removedProducts)
+   * Both calls are made in parallel. After completion, the catalog is refreshed.
+   */
+  private async commitQuickReview(): Promise<void> {
+    this.quickReviewJustClosed = true;
+    this.quickReviewOpen = false;
+    this.quickReviewCurrentProduct = null;
+
+    const hasUnpublish = this.quickReviewProductsToUnpublish.length > 0;
+    const hasRemove = this.quickReviewProductsToRemove.length > 0;
+
+    if (!hasUnpublish && !hasRemove) {
+      // Nothing was changed — just close
+      return;
+    }
+
+    const loader = await this.commonService.presentLoader();
+    loader.present();
+    this.quickReviewProcessing = true;
 
     try {
-        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-        const prompt = `Provide exactly a JSON array of strings representing the top 20 most frequently purchased grocery and household products for zipcode ${zipcode} (${city}, India) in the "${category}" category. Output strictly valid JSON array format like ["Product 1", "Product 2"].`;
+      const promises: Promise<any>[] = [];
 
-        const result = await model.generateContent(prompt);
-        let textResponse = result.response.text();
-        
-        // Clean markdown backticks if any
-        textResponse = textResponse.replace(/^```json/m, '').replace(/```$/m, '').trim();
-        const productList = JSON.parse(textResponse);
-        
-        return productList;
-    } catch (error) {
-        log.error({ error: `Gemini API Failure: ${error.message}` });
-        return []; // fail gracefully
-    }
-};
+      // ── Batch update: move products to 'unpublished' ──
+      if (hasUnpublish) {
+        promises.push(
+          lastValueFrom(
+            this.productsService.updateCatalogData({
+              products: this.quickReviewProductsToUnpublish
+            })
+          )
+        );
+      }
 
-module.exports = { fetchTrendsFromGemini };
-```
+      // ── Batch remove: remove products from catalog ──
+      if (hasRemove) {
+        promises.push(
+          lastValueFrom(
+            this.productsService.insertCatalogData({
+              products: [],
+              removedProducts: this.quickReviewProductsToRemove
+            })
+          )
+        );
+      }
 
-### 4. Cron Job Processor Workflow
-**Create File:** `d:\Sarvm\backend\catalogue_mgmt_service\src\apis\services\v1\mongoCatalog\dynamicCatalogCron.js`
+      await Promise.all(promises);
 
-```javascript
-// src/apis/services/v1/mongoCatalog/dynamicCatalogCron.js
-const cron = require('node-cron');
-const fs = require('fs');
-const path = require('path');
-const csv = require('csv-parser');
-const { Logger: log } = require('sarvm-utility');
-const AiProductTrends = require('../../models/mongoCatalog/aiProductTrendsSchema');
-const AreaProductInsights = require('../../models/mongoCatalog/areaProductInsightsSchema');
-const Product = require('../../models/mongoCatalog/productSchema');
-const { fetchTrendsFromGemini } = require('./geminiService');
+      // ── Update local state ──
+      const removedIds = new Set(this.quickReviewProductsToRemove.map((p: any) => p.id));
+      const unpublishedIds = new Set(this.quickReviewProductsToUnpublish.map((p: any) => p.id));
 
-const runNightlyProcessor = async () => {
-    log.info({ info: 'Starting Dynamic Catalog Job from CSV...' });
-    
-    // Path to your CSV file in the backend root
-    // Place your file at: d:\Sarvm\backend\catalogue_mgmt_service\zipcodes.csv
-    const csvFilePath = path.join(process.cwd(), 'zipcodes.csv');
-    const records = [];
-
-    if (!fs.existsSync(csvFilePath)) {
-        log.error({ error: `CSV file not found at ${csvFilePath}. Please place zipcodes.csv in the backend root.` });
-        return;
-    }
-
-    // 1. Read and parse the CSV
-    fs.createReadStream(csvFilePath)
-        .pipe(csv())
-        .on('data', (data) => records.push(data))
-        .on('end', async () => {
-            log.info({ info: `CSV loaded. Processing ${records.length} regions.` });
-
-            // 2. Process each region one by one
-            for (const record of records) {
-                // We extract only the 3 columns we need; extra columns in your CSV are ignored
-                // Format: pincode, district, state
-                const { pincode, district, state } = record;
-                const category = 'grocery'; // Defaulting to grocery
-
-                if (!pincode) continue;
-
-                log.info({ info: `Processing Region: ${pincode} (${district})` });
-
-                try {
-                    // 3. Fetch AI Trends (checks cache or calls Gemini)
-                    const aiList = await fetchTrendsFromGemini(pincode, district, category);
-                    
-                    let finalList = [];
-                    let rank = 1;
-
-                    // 4. Normalize and Map to Master Product Database
-                    for (const prodName of aiList) {
-                        const masterProduct = await Product.findOne({
-                            prdNm: { $regex: new RegExp(prodName, 'i') }
-                        }).lean();
-
-                        if (masterProduct) {
-                            finalList.push({
-                                product_id: masterProduct._id.toString(),
-                                product_name: masterProduct.prdNm,
-                                score: 100 - rank++,
-                                source: 'AI_TREND',
-                                price_estimate: masterProduct.prc?.mrp || 0
-                            });
-                        }
-                    }
-
-                    // 5. Save/Update the Insights Collection
-                    if (finalList.length > 0) {
-                        await AreaProductInsights.findOneAndUpdate(
-                            { zipcode: pincode, category: category },
-                            { 
-                                city: district, 
-                                state: state, 
-                                rankedProducts: finalList, 
-                                lastUpdated: new Date() 
-                            },
-                            { upsert: true }
-                        );
-                        log.info({ info: `Successfully updated insights for ${pincode}` });
-                    }
-                } catch (err) {
-                    log.error({ error: `Error processing ${pincode}: ${err.message}` });
-                }
+      // Remove products from local data structures
+      this.getProductDataFromBackend.forEach((catalog: any) => {
+        catalog.categories.forEach((category: any) => {
+          category.products = category.products.filter((p: any) => !removedIds.has(p.id));
+          // Update status of unpublished products
+          category.products.forEach((p: any) => {
+            if (unpublishedIds.has(p.id)) {
+              p.status = 'unpublished';
             }
-            log.info({ info: 'Dynamic Catalog Generation Job Completed.' });
+          });
         });
-};
+      });
 
-const initCron = () => {
-    // Runs at 2 AM every day
-    cron.schedule('0 2 * * *', () => {
-        runNightlyProcessor().catch(err => log.error({ error: err }));
-    });
-};
+      this.productList = this.productList.filter((p: any) => !removedIds.has(p.id));
+      removedIds.forEach(id => this.pendingOrUnpublishedProducts.delete(id));
 
-module.exports = { initCron, runNightlyProcessor };
-```
+      const totalProcessed = this.quickReviewProductsToUnpublish.length + this.quickReviewProductsToRemove.length;
+      this.commonService.success(
+        `${totalProcessed} product${totalProcessed > 1 ? 's' : ''} updated successfully`
+      );
 
-### 5. Controller for Fetching Data
-**Create File:** `d:\Sarvm\backend\catalogue_mgmt_service\src\apis\controllers\v1\mongoCatalog\dynamicCatalog.js`
+      // Refresh the current view
+      this.segmentChanged();
 
-```javascript
-// src/apis/controllers/v1/mongoCatalog/dynamicCatalog.js
-const AreaProductInsights = require('../../models/mongoCatalog/areaProductInsightsSchema');
-const { Logger: log } = require('sarvm-utility');
+    } catch (error: any) {
+      console.error('Error in Quick Review batch commit:', error);
+      this.commonService.danger(
+        error?.error?.error?.message || 'An error occurred while updating products'
+      );
+      // Refresh from backend on error to get accurate state
+      this.getCatalogDataFromBackend();
+    } finally {
+      this.quickReviewProcessing = false;
+      loader.dismiss();
 
-const getDynamicCatalogInsights = async (zipcode, city, state, category) => {
-    log.info({ info: 'Fetching Dynamic Catalog details' });
-    
-    // 1. Try highly specific zipcode match
-    let insights = await AreaProductInsights.findOne({ zipcode, category }).lean();
-    
-    // 2. Fallback to general city match
-    if (!insights && city) {
-        insights = await AreaProductInsights.findOne({ city, category }).lean();
+      // Clear accumulated arrays
+      this.quickReviewProductsToUnpublish = [];
+      this.quickReviewProductsToRemove = [];
+      this.quickReviewProducts = [];
     }
-
-    if (!insights) {
-        return { source: 'DEFAULT', catalog: [] }; // The frontend should fall back to standard Master Catalog behavior
-    }
-
-    return {
-        source: 'DYNAMIC',
-        catalog: insights.rankedProducts
-    };
-};
-
-module.exports = { getDynamicCatalogInsights };
-```
-
-### 6. API Route for Dynamic Catalog
-**Create File:** `d:\Sarvm\backend\catalogue_mgmt_service\src\apis\routes\v1\dynamicCatalog.js`
-
-```javascript
-// src/apis/routes/v1/dynamicCatalog.js
-const express = require('express');
-const { HttpResponseHandler, Logger: log } = require('sarvm-utility');
-const dynamicCatalogController = require('../../controllers/v1/mongoCatalog/dynamicCatalog');
-
-const router = express.Router();
-
-router.get('/insights', async (req, res, next) => {
-    try {
-        const { zipcode, city, state, category } = req.query;
-        if (!zipcode || !category) {
-            return HttpResponseHandler.badRequest(req, res, 'Zipcode and Category are required');
-            // Alternatively standard HTTP 400 validation depending on sarvm-utility
-        }
-
-        const result = await dynamicCatalogController.getDynamicCatalogInsights(zipcode, city, state, category);
-        HttpResponseHandler.success(req, res, result);
-    } catch (error) {
-        log.error({ error });
-        next(error);
-    }
-});
-
-module.exports = router;
-```
-
-### 7. Bind Routes (Modifying existing backend files)
-**Modify File:** `d:\Sarvm\backend\catalogue_mgmt_service\src\apis\routes\v1\index.js`
-
-*Add the following towards the top with other imports:*
-```javascript
-const dynamicCatalogRouter = require('./dynamicCatalog');
-```
-*Add the following towards the bottom near `router.use('/category'...`:*
-```javascript
-router.use('/dynamicCatalog', dynamicCatalogRouter);
-```
-
-**Modify File:** `d:\Sarvm\backend\catalogue_mgmt_service\server.js`
-
-*Add this somewhere around line 21 (inside `InitApp(app).then(() => {`):*
-```javascript
-const { initCron } = require('./src/apis/services/v1/mongoCatalog/dynamicCatalogCron');
-initCron(); 
-```
-
----
-
-## FRONTEND CODE (hha_web)
-
-### 1. Application Constants
-**Modify File:** `d:\Sarvm\frontend\hha_web\src\app\config\constants.ts`
-
-*Inside the `ApiUrls` object (approx line 122), append the new route:*
-```typescript
-  dynamicCatalogInsights: '/cms/apis/v1/dynamicCatalog/insights',
-```
-
-### 2. Catalogue Service 
-**Modify File:** `d:\Sarvm\frontend\hha_web\src\app\lib\services\catalogue.service.ts`
-
-*Add this new function block directly inside the `CatalogueService` class:*
-```typescript
-  getDynamicInsights(zipcode: string, city: string, state: string, category: string) {
-    // Note: ensure the environment base URL corresponds to the proxy resolving to the catalogue service node process. 
-    const url = `${environment.baseUrl}${ApiUrls.dynamicCatalogInsights}?zipcode=${zipcode}&city=${city}&state=${state}&category=${category}`;
-    return this.commonApi.getDataByUrl(url);
-  }
-```
-
-### 3. Google Component Updates
-**Modify File:** `d:\Sarvm\frontend\hha_web\src\app\pages\store\google-stores\google-stores.component.ts`
-
-*Locate the `loadShopData()` method. You will inject the new dynamic logic whenever a Google shop (unverified profile) is loaded.*
-
-**Modify `loadShopData` as follows:**
-```typescript
-  loadShopData() {
-    this.commonservice.presentProgressBarLoading();
-    this.catalogueService.getmerchant(this.profileUrl!).subscribe({
-      next: async (res: any) => {
-        this.shopData = res;
-        this.shopProfileUrl = res?.shop?.profileUrl || null;
-        
-        // --- NEW DYNAMIC CATALOG HOOK ---
-        const shopZip = res?.shop?.address?.zipcode || '110001'; // Extract real zip if available
-        const shopCity = res?.shop?.address?.city || 'Delhi';
-        
-        if (res?.catalog?.length) {
-          this.selectedCategoryId = res.catalog[0].id;
-          
-          try {
-            const dynamicRes: any = await this.catalogueService.getDynamicInsights(shopZip, shopCity, '', 'grocery').toPromise();
-            
-            if (dynamicRes?.data?.source === 'DYNAMIC') {
-              // Extract the highly ranked subset
-              const curatedProducts = dynamicRes.data.catalog; 
-              
-              // Map AI/Dynamic data back to the UI format expected by your templates
-              res.catalog[0].categories[0].products = curatedProducts.map((p: any) => ({
-                 prdNm: p.product_name,
-                 price: { mrp: p.price_estimate || 0 },
-                 quantity: { soldBy: '1 unit', minQty: 1 },
-                 media: { imgTh: null, img1: null },
-                 status: 'PUBLISHED'
-              }));
-            }
-          } catch(e) {
-             console.log("Failed to fetch dynamic insights, defaulting to standard catalog.", e);
-          }
-        }
-        // ---------------------------------
-
-        this.loading = false;
-        this.flag = !res?.catalog?.length;
-
-        if (res?.catalog?.length) {
-          this.selectedCategory = 0;
-          this.selectedSubCategory = 0;
-          this.selectedMicroCategory = 1;
-        }
-        
-        const vegnonVeg = this.storageService.getItem(Constants.SELECT_PREFERENCE);
-        this.isVeg = vegnonVeg ? vegnonVeg === 'veg' : false;
-        this.commonservice.closeProgressBarLoading();
-      },
-      error: (err) => {
-        console.error('Failed to fetch profile.json', err);
-        this.loading = false;
-        this.flag = true;
-        this.commonservice.closeProgressBarLoading();
-      },
-    });
   }
 ```
 
 ---
 
-## Environment Setup Details (How to Run)
+## Step 2 — HTML Changes
 
-1. **Environmental Variables:**
-   * Open `d:\Sarvm\backend\catalogue_mgmt_service\.lcl.env` (or whatever env file you use to run locally).
-   * Add `GEMINI_API_KEY=your_google_api_key_here` (Optional, as the script provides a fallback dummy list for local testing).
+**File:** `frontend/retailer_app/src/app/pages/catelog/my-catalog/my-catalog.component.html`
 
-2. **Database:**
-   * Your local MongoDB must be running. Running the backend code above will automatically create the `ai_product_trends` and `area_product_insights` collections when the cron job performs upserts.
+Add the Quick Review modal **at the very end of the file**, after the last `</ion-modal>` tag (after line 254):
 
-3. **Running the Backend locally:**
-   ```bash
-   cd d:\Sarvm\backend\catalogue_mgmt_service
-   npm run lcl 
-   ```
-   *To immediately see it work without waiting for 2 AM, temporarily modify your cron schedule inside `dynamicCatalogCron.js` to `* * * * *` (runs every minute), and observe the console logs.*
+```html
+<!-- ═══════════════════════════════════════════════════════ -->
+<!-- QUICK REVIEW POPUP — Batch verify pending products     -->
+<!-- ═══════════════════════════════════════════════════════ -->
+<ion-modal [isOpen]="quickReviewOpen" class="quick-review-modal" [backdropDismiss]="false"
+  mode="ios" [breakpoints]="[0, 1]" initialBreakpoint="1"
+  [leaveAnimation]="leaveAnimation" [canDismiss]="canDismiss">
+  <ng-template>
+    <div class="quick-review-wrapper">
 
-4. **Running the Frontend locally:**
-   ```bash
-   cd d:\Sarvm\frontend\hha_web
-   npm install   # If you had new Angular updates
-   ionic serve
-   ```
-   *Open your frontend, click on a random Google Shop, and you will see the curated "Dynamic" catalog list populated instead of the massive master catalog!*
+      <!-- Header with close button -->
+      <ion-header mode="ios" class="ion-no-border">
+        <ion-toolbar>
+          <ion-title class="quick-review-title">
+            {{'areyousellingthis' | language : 'Are You Selling This ?'}}
+          </ion-title>
+          <ion-buttons slot="end">
+            <ion-button class="quick-review-close" (click)="closeQuickReview()">
+              <ion-icon name="close-outline"></ion-icon>
+            </ion-button>
+          </ion-buttons>
+        </ion-toolbar>
+      </ion-header>
+
+      <!-- Product display -->
+      <ion-content class="ion-padding" *ngIf="quickReviewCurrentProduct">
+        <div class="quick-review-content">
+
+          <!-- Product image area -->
+          <div class="quick-review-image-container">
+            <div class="quick-review-badge-left">
+              <ion-img src="assets/images/Insert_photo.svg"></ion-img>
+            </div>
+            <div class="quick-review-product-image">
+              <ion-img
+                [src]="quickReviewCurrentProduct?.media?.imgTh
+                       ? quickReviewCurrentProduct.media.imgTh
+                       : quickReviewCurrentProduct?.media?.img1
+                         ? quickReviewCurrentProduct.media.img1
+                         : 'assets/images/defaultImage.png'">
+              </ion-img>
+            </div>
+            <div class="quick-review-badge-right">
+              <ion-img
+                [src]="quickReviewCurrentProduct?.grd
+                       ? '/assets/award/award-' + quickReviewCurrentProduct.grd + '.svg'
+                       : '/assets/award/award0.png'">
+              </ion-img>
+            </div>
+          </div>
+
+          <!-- Counter -->
+          <div class="quick-review-counter">
+            <span>{{ getQuickReviewCounter() }}</span>
+          </div>
+
+          <!-- Product name -->
+          <div class="quick-review-product-name">
+            <p>{{ quickReviewCurrentProduct.id | language : quickReviewCurrentProduct.prdNm }}</p>
+          </div>
+
+          <!-- Yes / No buttons -->
+          <div class="quick-review-actions">
+            <ion-button expand="block" class="quick-review-yes-btn" shape="round" mode="ios"
+              (click)="onQuickReviewYes()">
+              {{'yes' | language : 'Yes'}}
+            </ion-button>
+            <ion-button expand="block" class="quick-review-no-btn" shape="round" mode="ios"
+              (click)="onQuickReviewNo()">
+              {{'no' | language : 'No'}}
+            </ion-button>
+          </div>
+
+        </div>
+      </ion-content>
+
+    </div>
+  </ng-template>
+</ion-modal>
+```
+
+---
+
+## Step 3 — SCSS Changes
+
+**File:** `frontend/retailer_app/src/app/pages/catelog/my-catalog/my-catalog.component.scss`
+
+Add the following styles **at the very end of the file** (after line 316):
+
+```scss
+// ═══════════════════════════════════════════════════════
+// QUICK REVIEW POPUP STYLES
+// ═══════════════════════════════════════════════════════
+
+.quick-review-modal {
+  --height: auto;
+  --max-height: 90vh;
+
+  .quick-review-wrapper {
+    background: #fff;
+    min-height: 500px;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .quick-review-title {
+    font-size: 18px;
+    font-weight: 700;
+    text-align: center;
+    color: #333;
+  }
+
+  .quick-review-close {
+    font-size: 28px;
+    color: #666;
+  }
+
+  .quick-review-content {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 0 16px;
+  }
+
+  // ── Image container with badge overlays ──
+  .quick-review-image-container {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    padding: 20px 0;
+
+    .quick-review-product-image {
+      width: 180px;
+      height: 180px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+
+      ion-img {
+        max-width: 100%;
+        max-height: 100%;
+        object-fit: contain;
+      }
+    }
+
+    .quick-review-badge-left {
+      position: absolute;
+      left: 20px;
+      top: 20px;
+
+      ion-img {
+        width: 40px;
+        height: 40px;
+        opacity: 0.7;
+      }
+    }
+
+    .quick-review-badge-right {
+      position: absolute;
+      right: 20px;
+      top: 20px;
+
+      ion-img {
+        width: 40px;
+        height: 40px;
+      }
+    }
+  }
+
+  // ── Counter badge ──
+  .quick-review-counter {
+    display: flex;
+    justify-content: flex-end;
+    width: 100%;
+    padding-right: 10px;
+    margin-bottom: 8px;
+
+    span {
+      background: #f0f0f0;
+      color: #666;
+      font-size: 13px;
+      font-weight: 500;
+      padding: 4px 12px;
+      border-radius: 12px;
+    }
+  }
+
+  // ── Product name pill ──
+  .quick-review-product-name {
+    width: 100%;
+    text-align: center;
+    margin-bottom: 24px;
+
+    p {
+      display: inline-block;
+      background: #f5f5f5;
+      border: 1px solid #e0e0e0;
+      border-radius: 20px;
+      padding: 10px 30px;
+      font-size: 16px;
+      font-weight: 500;
+      color: #333;
+      margin: 0;
+      min-width: 200px;
+    }
+  }
+
+  // ── Action buttons ──
+  .quick-review-actions {
+    width: 100%;
+    padding: 0 16px;
+
+    .quick-review-yes-btn {
+      --background: var(--ion-color-primary, #10BAB2);
+      --color: #fff;
+      --border-radius: 25px;
+      margin-bottom: 12px;
+      height: 48px;
+      font-size: 16px;
+      font-weight: 600;
+      text-transform: capitalize;
+    }
+
+    .quick-review-no-btn {
+      --background: var(--ion-color-primary, #10BAB2);
+      --color: #fff;
+      --border-radius: 25px;
+      height: 48px;
+      font-size: 16px;
+      font-weight: 600;
+      text-transform: capitalize;
+    }
+  }
+}
+```
+
+---
+
+## How It Works — End to End
+
+```
+1. User navigates to My Catalog → Pending tab
+2. segmentChanged() fires → filters pending products → auto-opens Quick Review
+3. Modal appears with first pending product, counter shows "1/N"
+4. User taps YES:
+   → Product clone added to quickReviewProductsToUnpublish[] (status → 'unpublished')
+   → Index advances, next product shown, counter updates to "2/N"
+5. User taps NO:
+   → Product added to quickReviewProductsToRemove[]
+   → Index advances, next product shown
+6. When user taps ✕ OR last product is reviewed:
+   → commitQuickReview() fires
+   → Loader shown
+   → Two API calls in parallel:
+     a) updateCatalogData({ products: [...unpublished] })
+     b) insertCatalogData({ products: [], removedProducts: [...removed] })
+   → Local state updated (products removed / status changed)
+   → Success toast shown
+   → segmentChanged() called to refresh the product list
+   → Loader dismissed
+```
+
+---
+
+## API Calls Used (Existing — No Changes Needed)
+
+| Method | API | Purpose |
+|--------|-----|---------|
+| `updateCatalogData()` | `PUT /rms/apis/v2/catalog/update/{shopId}` | Changes product status (pending → unpublished) |
+| `insertCatalogData()` | `PUT /rms/apis/v2/catalog/{shopId}` | Removes products from catalog via `removedProducts` array |
+
+Both methods are already defined in `products.service.ts` and work with arrays of products.
+
+---
+
+## Important: Loop Guard
+
+Since `commitQuickReview()` calls `this.segmentChanged()` to refresh the list, and `segmentChanged()` auto-opens the Quick Review when pending products exist, a `quickReviewJustClosed` boolean flag is used to prevent the popup from immediately reopening after a commit. The flag is set to `true` before committing and reset to `false` at the end of `segmentChanged()`.
+
+---
+
+## Testing Checklist
+
+- [ ] Open My Catalog → Pending tab with pending products → Quick Review popup auto-opens
+- [ ] Counter shows correct "1/N" format
+- [ ] Product image, name, and badge display correctly
+- [ ] Tap **Yes** → product counter advances, next product shows
+- [ ] Tap **No** → product counter advances, next product shows
+- [ ] Tap **✕ (close)** midway → loader shows → products processed in batch → success toast → pending list updates
+- [ ] Review all products (reach end) → auto-commits → same behavior as closing
+- [ ] After commit: products marked Yes appear in **Unavailable** tab
+- [ ] After commit: products marked No are removed entirely from all tabs
+- [ ] Open Pending tab with **no** pending products → popup does NOT open
+- [ ] Existing product-card click behavior (cross button, card click) still works unchanged
+- [ ] Pull-to-refresh still works
+- [ ] Switching between category tabs (All, Grocery, etc.) while on Pending recalculates correctly
+- [ ] If API call fails → error toast shown, catalog refreshes from backend
+- [ ] Popup does NOT reopen after committing (loop guard works)
