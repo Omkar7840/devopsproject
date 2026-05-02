@@ -1,566 +1,400 @@
-# Quick Review Popup — Implementation Guide
+# Geo-Intelligent Auto Catalog System V2 — Full Implementation
 
-## Feature Summary
-
-When a retailer opens the **Pending** tab in My Catalog and there are pending products, a full-screen modal automatically appears asking **"Are You Selling This?"** for each product. The retailer taps **Yes** (move to Unavailable) or **No** (remove from catalog), and the next product loads instantly. **No API call is made until the user closes the popup or finishes all products**, at which point a single batched call is made. This saves significant time compared to the current one-by-one flow.
-
----
-
-## Files Changed
-
-| File | Action |
-|------|--------|
-| `frontend/retailer_app/src/app/pages/catelog/my-catalog/my-catalog.component.ts` | **MODIFY** — Add Quick Review logic |
-| `frontend/retailer_app/src/app/pages/catelog/my-catalog/my-catalog.component.html` | **MODIFY** — Add Quick Review modal HTML |
-| `frontend/retailer_app/src/app/pages/catelog/my-catalog/my-catalog.component.scss` | **MODIFY** — Add Quick Review modal styles |
-
-> [!NOTE]
-> **No new files need to be created.** All changes are additions to existing files.  
-> **No backend changes are required.** The existing `insertCatalogData` and `updateCatalogData` APIs already support batched products and removed products.
+## Core Updates in V2
+1. **Segmented Schema (`trending` vs `popular`)**: Categories now have two distinct lists. `trending` contains products aggregated from nearby real shops. `popular` contains AI-generated or fallback products.
+2. **Fuzzy Catalogue Matching**: If the generated or aggregated product matches "a little" with the master catalogue (substring/partial match), the system will successfully map it to the common master catalogue product.
+3. **Frontend Integration**: 
+   - **Registered Shops**: Intersection logic. Shows products from the retailer's catalog that are geographically popular *first*, followed by the rest of the retailer's catalog.
+   - **Google API Shops**: Fallback logic. Uses the shop's Google-provided pincode, city, or state to fetch and display the geo-catalog automatically.
 
 ---
 
-## Step 1 — TypeScript Changes
+## Part 1: Backend Implementation
 
-**File:** `frontend/retailer_app/src/app/pages/catelog/my-catalog/my-catalog.component.ts`
+### 1. Update Schema
+**File:** `backend/catalogue_mgmt_service/src/apis/models/mongoCatalog/geoCatalogSchema.js`
 
-### 1A. Add new properties
+Split the `products` array into `trending` and `popular`.
 
-Find the line (around line 55):
+```js
+const mongoose = require('mongoose');
 
-```typescript
-pendingOrUnpublishedProducts: Set<number> = new Set();
+const geoCatalogProductSchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true, trim: true },
+    count: { type: Number, default: 0, min: 0 },
+    catalogueProductId: { type: String, default: null },
+    source: { type: String, enum: ['DB', 'AI', 'FALLBACK'], default: 'DB' },
+  },
+  { _id: false },
+);
+
+const geoCatalogCategorySchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true, trim: true },
+    trending: { type: [geoCatalogProductSchema], default: [] }, // Nearby Shops
+    popular: { type: [geoCatalogProductSchema], default: [] },  // AI Generated
+  },
+  { _id: false },
+);
+
+const geoCatalogSchema = new mongoose.Schema(
+  {
+    level: { type: String, required: true, enum: ['PINCODE', 'CITY', 'STATE', 'COUNTRY'] },
+    pincode: { type: String, default: null, index: true },
+    city: { type: String, default: null },
+    state: { type: String, default: null },
+    country: { type: String, default: null },
+    categories: { type: [geoCatalogCategorySchema], default: [] },
+    lastBuildAt: { type: Date, default: null },
+    buildStatus: { type: String, enum: ['SUCCESS', 'PARTIAL', 'FALLBACK', 'FAILED'], default: 'SUCCESS' },
+  },
+  { timestamps: true },
+);
+
+geoCatalogSchema.index({ level: 1, pincode: 1 }, { sparse: true });
+geoCatalogSchema.index({ level: 1, city: 1 }, { sparse: true });
+
+module.exports = mongoose.model('geo_catalogs', geoCatalogSchema);
 ```
 
-**Add the following lines BELOW it:**
+### 2. Update Partial/Fuzzy Matcher
+**File:** `backend/catalogue_mgmt_service/src/apis/services/v1/catalogueMatcher.service.js`
 
-```typescript
-  // ── Quick Review Popup Properties ──
-  quickReviewOpen: boolean = false;
-  quickReviewProducts: any[] = [];
-  quickReviewIndex: number = 0;
-  quickReviewCurrentProduct: any = null;
-  quickReviewProductsToUnpublish: any[] = [];
-  quickReviewProductsToRemove: any[] = [];
-  quickReviewProcessing: boolean = false;
-  quickReviewJustClosed: boolean = false;
-```
+Matches products "a little" using Postgres `ILIKE '%term%'`.
 
-### 1B. Add auto-open trigger inside `segmentChanged()`
+```js
+const { Logger: log } = require('sarvm-utility');
+const Product = require('../../models/product');
 
-Find the `segmentChanged()` method (around line 548). At the **very end** of the method, just **before** the line `loading.dismiss();` (around line 569), add:
+const matchAgainstCatalogue = async (productNames = []) => {
+  if (!productNames.length) return new Map();
 
-```typescript
-      // ── Auto-open Quick Review when Pending tab is selected ──
-      if (this.productStatus === 'pending' && this.filteredProducts.length > 0 && !this.quickReviewJustClosed) {
-        this.openQuickReview();
-      }
-      this.quickReviewJustClosed = false;
-```
+  const matchedMap = new Map();
+  const uniqueNames = [...new Set(productNames.map((n) => String(n).trim()).filter(Boolean))];
+  const allMatched = [];
 
-So the end of `segmentChanged()` should look like:
-
-```typescript
-    } else {
-      this.filteredProducts = [];
-    }
-    // ── Auto-open Quick Review when Pending tab is selected ──
-    if (this.productStatus === 'pending' && this.filteredProducts.length > 0 && !this.quickReviewJustClosed) {
-      this.openQuickReview();
-    }
-    this.quickReviewJustClosed = false;
-    loading.dismiss();
-  }
-```
-
-### 1C. Add all Quick Review methods
-
-Add the following methods **at the end of the class**, just **before** the closing `}` of the class (before line 1065):
-
-```typescript
-  // ═══════════════════════════════════════════════════════
-  // QUICK REVIEW POPUP — Batch review pending products
-  // ═══════════════════════════════════════════════════════
-
-  /**
-   * Opens the Quick Review popup.
-   * Collects all currently filtered pending products and starts the review cycle.
-   */
-  openQuickReview(): void {
-    // Deep-clone pending products so local mutations don't affect the list until commit
-    this.quickReviewProducts = this.filteredProducts
-      .filter((p: any) => p.status === 'pending')
-      .map((p: any) => JSON.parse(JSON.stringify(p)));
-
-    if (this.quickReviewProducts.length === 0) {
-      return;
-    }
-
-    this.quickReviewIndex = 0;
-    this.quickReviewCurrentProduct = this.quickReviewProducts[this.quickReviewIndex];
-    this.quickReviewProductsToUnpublish = [];
-    this.quickReviewProductsToRemove = [];
-    this.quickReviewProcessing = false;
-    this.quickReviewOpen = true;
-  }
-
-  /**
-   * Returns the display counter string, e.g. "3/25"
-   */
-  getQuickReviewCounter(): string {
-    return `${this.quickReviewIndex + 1}/${this.quickReviewProducts.length}`;
-  }
-
-  /**
-   * YES — the retailer sells this product.
-   * Mark it for status change to 'unpublished' (Unavailable) and move to next.
-   */
-  onQuickReviewYes(): void {
-    if (!this.quickReviewCurrentProduct) return;
-
-    // Clone the product and set status to 'unpublished'
-    const product = { ...this.quickReviewCurrentProduct, status: 'unpublished' };
-    this.quickReviewProductsToUnpublish.push(product);
-
-    this.advanceQuickReview();
-  }
-
-  /**
-   * NO — the retailer does NOT sell this product.
-   * Mark it for removal from catalog and move to next.
-   */
-  onQuickReviewNo(): void {
-    if (!this.quickReviewCurrentProduct) return;
-
-    this.quickReviewProductsToRemove.push(this.quickReviewCurrentProduct);
-
-    this.advanceQuickReview();
-  }
-
-  /**
-   * Advances to the next product, or commits if all products are reviewed.
-   */
-  private advanceQuickReview(): void {
-    if (this.quickReviewIndex >= this.quickReviewProducts.length - 1) {
-      // All products reviewed — commit the batch
-      this.commitQuickReview();
-    } else {
-      this.quickReviewIndex++;
-      this.quickReviewCurrentProduct = this.quickReviewProducts[this.quickReviewIndex];
-    }
-  }
-
-  /**
-   * CLOSE (✕) — the retailer exits early.
-   * Commit whatever decisions have been made so far.
-   */
-  closeQuickReview(): void {
-    this.commitQuickReview();
-  }
-
-  /**
-   * Commits all accumulated Yes/No decisions in a single batched API call.
-   * - Products marked YES → updateCatalogData (status changed to 'unpublished')
-   * - Products marked NO  → insertCatalogData  (removedProducts)
-   * Both calls are made in parallel. After completion, the catalog is refreshed.
-   */
-  private async commitQuickReview(): Promise<void> {
-    this.quickReviewJustClosed = true;
-    this.quickReviewOpen = false;
-    this.quickReviewCurrentProduct = null;
-
-    const hasUnpublish = this.quickReviewProductsToUnpublish.length > 0;
-    const hasRemove = this.quickReviewProductsToRemove.length > 0;
-
-    if (!hasUnpublish && !hasRemove) {
-      // Nothing was changed — just close
-      return;
-    }
-
-    const loader = await this.commonService.presentLoader();
-    loader.present();
-    this.quickReviewProcessing = true;
-
+  // Match chunks using ILIKE %name% for fuzzy matching
+  for (let i = 0; i < uniqueNames.length; i += 100) {
+    const chunk = uniqueNames.slice(i, i + 100);
     try {
-      const promises: Promise<any>[] = [];
-
-      // ── Batch update: move products to 'unpublished' ──
-      if (hasUnpublish) {
-        promises.push(
-          lastValueFrom(
-            this.productsService.updateCatalogData({
-              products: this.quickReviewProductsToUnpublish
-            })
-          )
-        );
-      }
-
-      // ── Batch remove: remove products from catalog ──
-      if (hasRemove) {
-        promises.push(
-          lastValueFrom(
-            this.productsService.insertCatalogData({
-              products: [],
-              removedProducts: this.quickReviewProductsToRemove
-            })
-          )
-        );
-      }
-
-      await Promise.all(promises);
-
-      // ── Update local state ──
-      const removedIds = new Set(this.quickReviewProductsToRemove.map((p: any) => p.id));
-      const unpublishedIds = new Set(this.quickReviewProductsToUnpublish.map((p: any) => p.id));
-
-      // Remove products from local data structures
-      this.getProductDataFromBackend.forEach((catalog: any) => {
-        catalog.categories.forEach((category: any) => {
-          category.products = category.products.filter((p: any) => !removedIds.has(p.id));
-          // Update status of unpublished products
-          category.products.forEach((p: any) => {
-            if (unpublishedIds.has(p.id)) {
-              p.status = 'unpublished';
-            }
+      const results = await Product.query()
+        .select('id', 'name', 'dummyKey', 'image', 'status')
+        .where('status', '=', 'ACTIVE')
+        .where((builder) => {
+          chunk.forEach((productName) => {
+            const safeName = productName.replace(/[%_]/g, '\\$&'); // Escape SQL wildcards
+            builder.orWhere('name', 'ilike', `%${safeName}%`);
           });
         });
-      });
-
-      this.productList = this.productList.filter((p: any) => !removedIds.has(p.id));
-      removedIds.forEach(id => this.pendingOrUnpublishedProducts.delete(id));
-
-      const totalProcessed = this.quickReviewProductsToUnpublish.length + this.quickReviewProductsToRemove.length;
-      this.commonService.success(
-        `${totalProcessed} product${totalProcessed > 1 ? 's' : ''} updated successfully`
-      );
-
-      // Refresh the current view
-      this.segmentChanged();
-
-    } catch (error: any) {
-      console.error('Error in Quick Review batch commit:', error);
-      this.commonService.danger(
-        error?.error?.error?.message || 'An error occurred while updating products'
-      );
-      // Refresh from backend on error to get accurate state
-      this.getCatalogDataFromBackend();
-    } finally {
-      this.quickReviewProcessing = false;
-      loader.dismiss();
-
-      // Clear accumulated arrays
-      this.quickReviewProductsToUnpublish = [];
-      this.quickReviewProductsToRemove = [];
-      this.quickReviewProducts = [];
+      allMatched.push(...results);
+    } catch (error) {
+      log.warn({ warn: 'CatalogueMatcher chunk failed', details: error.message });
     }
   }
+
+  // Map generated names back to their best fuzzy-matched DB product
+  uniqueNames.forEach((searchName) => {
+    const searchKey = searchName.toLowerCase();
+    
+    // Find the first DB product that partially matches (either contains search word, or search word contains it)
+    const match = allMatched.find(
+      (dbProd) => dbProd.name.toLowerCase().includes(searchKey) || searchKey.includes(dbProd.name.toLowerCase())
+    );
+
+    if (match && !matchedMap.has(searchKey)) {
+      matchedMap.set(searchKey, { id: match.id, name: match.name });
+    }
+  });
+
+  return matchedMap;
+};
+
+const filterByCatalogue = (products = [], catalogueMap) => {
+  return products.map((product) => {
+    const key = String(product.name).trim().toLowerCase();
+    const matched = catalogueMap.get(key);
+    if (!matched) return null;
+
+    return {
+      ...product,
+      name: matched.name, // Use common/standardized catalogue name
+      catalogueProductId: matched.id,
+    };
+  }).filter(Boolean);
+};
+
+module.exports = { matchAgainstCatalogue, filterByCatalogue };
+```
+
+### 3. Update Pincode Builder for Trending vs Popular
+**File:** `backend/catalogue_mgmt_service/src/apis/services/v1/pincodeCatalogBuilder.service.js`
+
+Update the `applyCatalogueMatching` function to separate the arrays.
+
+```js
+// Inside pincodeCatalogBuilder.service.js
+const applyCatalogueMatching = async (categories = []) => {
+  const allProductNames = [];
+  categories.forEach((cat) => {
+    (cat.products || []).forEach((p) => allProductNames.push(p.name));
+  });
+
+  const catalogueMap = await matchAgainstCatalogue(allProductNames);
+
+  // Split into trending and popular
+  return categories.map((category) => {
+    const validProducts = filterByCatalogue(category.products, catalogueMap);
+    
+    const trending = validProducts.filter(p => p.source === 'DB').slice(0, TOP_PRODUCTS_LIMIT);
+    const popular = validProducts.filter(p => p.source !== 'DB').slice(0, TOP_PRODUCTS_LIMIT);
+
+    return {
+      name: category.name,
+      trending,
+      popular
+    };
+  });
+};
+```
+*(Ensure all code accessing `category.products` in this file is updated to `category.trending` and `category.popular` where applicable)*
+
+### 4. Update Geo Hierarchy Aggregation
+**File:** `backend/catalogue_mgmt_service/src/apis/services/v1/geoHierarchy.service.js`
+
+```js
+const aggregateCategories = (documents = []) => {
+  const categoryMap = new Map();
+
+  documents.forEach((document) => {
+    (document?.categories || []).forEach((category) => {
+      const categoryName = String(category?.name || '').trim().toLowerCase();
+      if (!categoryName) return;
+
+      if (!categoryMap.has(categoryName)) {
+        categoryMap.set(categoryName, { trending: new Map(), popular: new Map() });
+      }
+
+      const mapObj = categoryMap.get(categoryName);
+
+      const addProduct = (product, mapRef) => {
+        const pName = String(product?.name || '').trim().toLowerCase();
+        if (!pName) return;
+        mapRef.set(pName, {
+          count: (mapRef.get(pName)?.count || 0) + Number(product?.count || 0),
+          catalogueProductId: product.catalogueProductId,
+          source: product.source,
+        });
+      };
+
+      (category.trending || []).forEach(p => addProduct(p, mapObj.trending));
+      (category.popular || []).forEach(p => addProduct(p, mapObj.popular));
+    });
+  });
+
+  return Array.from(categoryMap.entries()).map(([name, maps]) => {
+    const mapToArray = (map) => Array.from(map.entries())
+      .map(([pName, data]) => ({ name: pName, ...data }))
+      .sort((l, r) => r.count - l.count || l.name.localeCompare(r.name))
+      .slice(0, 10);
+
+    return {
+      name,
+      trending: mapToArray(maps.trending),
+      popular: mapToArray(maps.popular),
+    };
+  }).sort((l, r) => l.name.localeCompare(r.name));
+};
 ```
 
 ---
 
-## Step 2 — HTML Changes
+## Part 2: Frontend Implementation (`hha_web`)
 
-**File:** `frontend/retailer_app/src/app/pages/catelog/my-catalog/my-catalog.component.html`
+### 1. Angular Service
+**File:** `frontend/hha_web/src/app/services/geo-catalog.service.ts`
 
-Add the Quick Review modal **at the very end of the file**, after the last `</ion-modal>` tag (after line 254):
+```typescript
+import { Injectable } from '@angular/core';
+import { HttpClient, HttpParams } from '@angular/common/http';
+import { environment } from 'src/environments/environment';
+import { Observable } from 'rxjs';
 
-```html
-<!-- ═══════════════════════════════════════════════════════ -->
-<!-- QUICK REVIEW POPUP — Batch verify pending products     -->
-<!-- ═══════════════════════════════════════════════════════ -->
-<ion-modal [isOpen]="quickReviewOpen" class="quick-review-modal" [backdropDismiss]="false"
-  mode="ios" [breakpoints]="[0, 1]" initialBreakpoint="1"
-  [leaveAnimation]="leaveAnimation" [canDismiss]="canDismiss">
-  <ng-template>
-    <div class="quick-review-wrapper">
+@Injectable({
+  providedIn: 'root'
+})
+export class GeoCatalogService {
+  constructor(private http: HttpClient) {}
 
-      <!-- Header with close button -->
-      <ion-header mode="ios" class="ion-no-border">
-        <ion-toolbar>
-          <ion-title class="quick-review-title">
-            {{'areyousellingthis' | language : 'Are You Selling This ?'}}
-          </ion-title>
-          <ion-buttons slot="end">
-            <ion-button class="quick-review-close" (click)="closeQuickReview()">
-              <ion-icon name="close-outline"></ion-icon>
-            </ion-button>
-          </ion-buttons>
-        </ion-toolbar>
-      </ion-header>
+  getResolvedGeoCatalog(params: { shopId?: number; pincode?: string; city?: string; state?: string }): Observable<any> {
+    let httpParams = new HttpParams();
+    if (params.shopId) httpParams = httpParams.set('shopId', params.shopId.toString());
+    if (params.pincode) httpParams = httpParams.set('pincode', params.pincode);
+    if (params.city) httpParams = httpParams.set('city', params.city);
+    if (params.state) httpParams = httpParams.set('state', params.state);
 
-      <!-- Product display -->
-      <ion-content class="ion-padding" *ngIf="quickReviewCurrentProduct">
-        <div class="quick-review-content">
-
-          <!-- Product image area -->
-          <div class="quick-review-image-container">
-            <div class="quick-review-badge-left">
-              <ion-img src="assets/images/Insert_photo.svg"></ion-img>
-            </div>
-            <div class="quick-review-product-image">
-              <ion-img
-                [src]="quickReviewCurrentProduct?.media?.imgTh
-                       ? quickReviewCurrentProduct.media.imgTh
-                       : quickReviewCurrentProduct?.media?.img1
-                         ? quickReviewCurrentProduct.media.img1
-                         : 'assets/images/defaultImage.png'">
-              </ion-img>
-            </div>
-            <div class="quick-review-badge-right">
-              <ion-img
-                [src]="quickReviewCurrentProduct?.grd
-                       ? '/assets/award/award-' + quickReviewCurrentProduct.grd + '.svg'
-                       : '/assets/award/award0.png'">
-              </ion-img>
-            </div>
-          </div>
-
-          <!-- Counter -->
-          <div class="quick-review-counter">
-            <span>{{ getQuickReviewCounter() }}</span>
-          </div>
-
-          <!-- Product name -->
-          <div class="quick-review-product-name">
-            <p>{{ quickReviewCurrentProduct.id | language : quickReviewCurrentProduct.prdNm }}</p>
-          </div>
-
-          <!-- Yes / No buttons -->
-          <div class="quick-review-actions">
-            <ion-button expand="block" class="quick-review-yes-btn" shape="round" mode="ios"
-              (click)="onQuickReviewYes()">
-              {{'yes' | language : 'Yes'}}
-            </ion-button>
-            <ion-button expand="block" class="quick-review-no-btn" shape="round" mode="ios"
-              (click)="onQuickReviewNo()">
-              {{'no' | language : 'No'}}
-            </ion-button>
-          </div>
-
-        </div>
-      </ion-content>
-
-    </div>
-  </ng-template>
-</ion-modal>
-```
-
----
-
-## Step 3 — SCSS Changes
-
-**File:** `frontend/retailer_app/src/app/pages/catelog/my-catalog/my-catalog.component.scss`
-
-Add the following styles **at the very end of the file** (after line 316):
-
-```scss
-// ═══════════════════════════════════════════════════════
-// QUICK REVIEW POPUP STYLES
-// ═══════════════════════════════════════════════════════
-
-.quick-review-modal {
-  --height: auto;
-  --max-height: 90vh;
-
-  .quick-review-wrapper {
-    background: #fff;
-    min-height: 500px;
-    display: flex;
-    flex-direction: column;
-  }
-
-  .quick-review-title {
-    font-size: 18px;
-    font-weight: 700;
-    text-align: center;
-    color: #333;
-  }
-
-  .quick-review-close {
-    font-size: 28px;
-    color: #666;
-  }
-
-  .quick-review-content {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    padding: 0 16px;
-  }
-
-  // ── Image container with badge overlays ──
-  .quick-review-image-container {
-    position: relative;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 100%;
-    padding: 20px 0;
-
-    .quick-review-product-image {
-      width: 180px;
-      height: 180px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-
-      ion-img {
-        max-width: 100%;
-        max-height: 100%;
-        object-fit: contain;
-      }
-    }
-
-    .quick-review-badge-left {
-      position: absolute;
-      left: 20px;
-      top: 20px;
-
-      ion-img {
-        width: 40px;
-        height: 40px;
-        opacity: 0.7;
-      }
-    }
-
-    .quick-review-badge-right {
-      position: absolute;
-      right: 20px;
-      top: 20px;
-
-      ion-img {
-        width: 40px;
-        height: 40px;
-      }
-    }
-  }
-
-  // ── Counter badge ──
-  .quick-review-counter {
-    display: flex;
-    justify-content: flex-end;
-    width: 100%;
-    padding-right: 10px;
-    margin-bottom: 8px;
-
-    span {
-      background: #f0f0f0;
-      color: #666;
-      font-size: 13px;
-      font-weight: 500;
-      padding: 4px 12px;
-      border-radius: 12px;
-    }
-  }
-
-  // ── Product name pill ──
-  .quick-review-product-name {
-    width: 100%;
-    text-align: center;
-    margin-bottom: 24px;
-
-    p {
-      display: inline-block;
-      background: #f5f5f5;
-      border: 1px solid #e0e0e0;
-      border-radius: 20px;
-      padding: 10px 30px;
-      font-size: 16px;
-      font-weight: 500;
-      color: #333;
-      margin: 0;
-      min-width: 200px;
-    }
-  }
-
-  // ── Action buttons ──
-  .quick-review-actions {
-    width: 100%;
-    padding: 0 16px;
-
-    .quick-review-yes-btn {
-      --background: var(--ion-color-primary, #10BAB2);
-      --color: #fff;
-      --border-radius: 25px;
-      margin-bottom: 12px;
-      height: 48px;
-      font-size: 16px;
-      font-weight: 600;
-      text-transform: capitalize;
-    }
-
-    .quick-review-no-btn {
-      --background: var(--ion-color-primary, #10BAB2);
-      --color: #fff;
-      --border-radius: 25px;
-      height: 48px;
-      font-size: 16px;
-      font-weight: 600;
-      text-transform: capitalize;
-    }
+    return this.http.get(`${environment.apiBaseUrl}/cms/apis/v1/geo/catalog`, { params: httpParams });
   }
 }
 ```
 
----
+### 2. Component Logic (Shop Catalog Page)
+**File:** `frontend/hha_web/src/app/pages/shop-details/shop-details.component.ts`
 
-## How It Works — End to End
+```typescript
+import { Component, OnInit } from '@angular/core';
+import { GeoCatalogService } from 'src/app/services/geo-catalog.service';
+import { ShopService } from 'src/app/services/shop.service'; // Assuming existing service
 
+@Component({
+  selector: 'app-shop-details',
+  templateUrl: './shop-details.component.html',
+  styleUrls: ['./shop-details.component.scss']
+})
+export class ShopDetailsComponent implements OnInit {
+  shopData: any; // Passed from router or fetched
+  displayCatalog: any[] = [];
+  isLoading = true;
+
+  constructor(
+    private geoCatalogService: GeoCatalogService,
+    private shopService: ShopService
+  ) {}
+
+  ngOnInit() {
+    this.loadShopCatalog();
+  }
+
+  loadShopCatalog() {
+    this.isLoading = true;
+
+    if (this.shopData.isRegistered) {
+      // 1. Registered Shop Flow
+      this.shopService.getRetailerCatalog(this.shopData.shopId).subscribe(retailerCatalog => {
+        this.geoCatalogService.getResolvedGeoCatalog({ shopId: this.shopData.shopId }).subscribe(
+          (geoRes) => {
+            this.processRegisteredShop(retailerCatalog, geoRes.catalog);
+            this.isLoading = false;
+          },
+          (error) => {
+             // Fallback if no geo catalog exists
+             this.displayCatalog = retailerCatalog;
+             this.isLoading = false;
+          }
+        );
+      });
+    } else {
+      // 2. Google API (Unregistered) Shop Flow
+      // Pass whatever location data Google gave us
+      this.geoCatalogService.getResolvedGeoCatalog({ 
+        pincode: this.shopData.pincode,
+        city: this.shopData.city,
+        state: this.shopData.state
+      }).subscribe(
+        (geoRes) => {
+          this.processUnregisteredShop(geoRes.catalog);
+          this.isLoading = false;
+        },
+        (error) => {
+          this.displayCatalog = []; // No data available
+          this.isLoading = false;
+        }
+      );
+    }
+  }
+
+  // Merges Retailer Catalog with Geo Insights
+  processRegisteredShop(retailerCatalog: any[], geoCatalog: any) {
+    const geoProductNames = new Set<string>();
+    
+    // Aggregate all geo names (trending + popular)
+    (geoCatalog?.categories || []).forEach(cat => {
+      (cat.trending || []).forEach(p => geoProductNames.add(p.name.toLowerCase()));
+      (cat.popular || []).forEach(p => geoProductNames.add(p.name.toLowerCase()));
+    });
+
+    const matchedGeoItems = [];
+    const remainingRetailerItems = [];
+
+    // Split retailer catalog into geographically relevant vs remaining
+    retailerCatalog.forEach(item => {
+      const isGeoRelevant = geoProductNames.has(item.productName.toLowerCase());
+      if (isGeoRelevant) {
+        matchedGeoItems.push({ ...item, isRecommended: true });
+      } else {
+        remainingRetailerItems.push(item);
+      }
+    });
+
+    // Display Matched/Relevant first, then the rest
+    this.displayCatalog = [...matchedGeoItems, ...remainingRetailerItems];
+  }
+
+  // Prepares Geo Catalog for Unregistered Shops
+  processUnregisteredShop(geoCatalog: any) {
+    this.displayCatalog = [];
+    
+    (geoCatalog?.categories || []).forEach(cat => {
+      // Show Trending (Local shops) first, then Popular (AI generated)
+      (cat.trending || []).forEach(p => {
+        this.displayCatalog.push({ productName: p.name, category: cat.name, isTrending: true });
+      });
+      (cat.popular || []).forEach(p => {
+        this.displayCatalog.push({ productName: p.name, category: cat.name, isPopular: true });
+      });
+    });
+  }
+}
 ```
-1. User navigates to My Catalog → Pending tab
-2. segmentChanged() fires → filters pending products → auto-opens Quick Review
-3. Modal appears with first pending product, counter shows "1/N"
-4. User taps YES:
-   → Product clone added to quickReviewProductsToUnpublish[] (status → 'unpublished')
-   → Index advances, next product shown, counter updates to "2/N"
-5. User taps NO:
-   → Product added to quickReviewProductsToRemove[]
-   → Index advances, next product shown
-6. When user taps ✕ OR last product is reviewed:
-   → commitQuickReview() fires
-   → Loader shown
-   → Two API calls in parallel:
-     a) updateCatalogData({ products: [...unpublished] })
-     b) insertCatalogData({ products: [], removedProducts: [...removed] })
-   → Local state updated (products removed / status changed)
-   → Success toast shown
-   → segmentChanged() called to refresh the product list
-   → Loader dismissed
+
+### 3. Frontend HTML Template
+**File:** `frontend/hha_web/src/app/pages/shop-details/shop-details.component.html`
+
+```html
+<div class="catalog-container" *ngIf="!isLoading">
+  
+  <div *ngIf="displayCatalog.length === 0" class="no-data">
+    No products found for this shop.
+  </div>
+
+  <div class="product-item" *ngFor="let item of displayCatalog">
+    <!-- UI Badges for Recommended/Trending -->
+    <div class="badges">
+       <span class="badge recommended" *ngIf="item.isRecommended">🔥 Local Favorite</span>
+       <span class="badge trending" *ngIf="item.isTrending">📈 Nearby Trending</span>
+       <span class="badge popular" *ngIf="item.isPopular">⭐ Highly Popular</span>
+    </div>
+
+    <div class="product-info">
+      <h3>{{ item.productName }}</h3>
+      <p>{{ item.category }}</p>
+    </div>
+  </div>
+
+</div>
 ```
 
 ---
 
-## API Calls Used (Existing — No Changes Needed)
+## Part 3: Postman Testing Method
 
-| Method | API | Purpose |
-|--------|-----|---------|
-| `updateCatalogData()` | `PUT /rms/apis/v2/catalog/update/{shopId}` | Changes product status (pending → unpublished) |
-| `insertCatalogData()` | `PUT /rms/apis/v2/catalog/{shopId}` | Removes products from catalog via `removedProducts` array |
+### Testing the Backend Hierarchy & Fuzzy Matching
+1. **Trigger Pincode Build**
+   - Method: `POST`
+   - URL: `http://localhost:2210/cms/apis/v1/geo/test/pincode`
+   - Body: `{ "pincode": "560100" }`
+   - **Verification**: Check if the response contains `trending` and `popular` arrays inside the categories. Verify that product names returned have been "fuzzily matched" (e.g., if AI generated "Amul Milk", the response should standardize it to "Amul Gold Milk 500ml" if that exists in Postgres).
 
-Both methods are already defined in `products.service.ts` and work with arrays of products.
+2. **Test Fallback Endpoint (Google API Shop Simulation)**
+   - Method: `GET`
+   - URL: `http://localhost:2210/cms/apis/v1/geo/catalog?city=Bangalore&state=Karnataka` (Simulating missing pincode)
+   - **Verification**: The API should cascade from Pincode -> City -> State -> Country and return the City or State catalog.
 
----
-
-## Important: Loop Guard
-
-Since `commitQuickReview()` calls `this.segmentChanged()` to refresh the list, and `segmentChanged()` auto-opens the Quick Review when pending products exist, a `quickReviewJustClosed` boolean flag is used to prevent the popup from immediately reopening after a commit. The flag is set to `true` before committing and reset to `false` at the end of `segmentChanged()`.
-
----
-
-## Testing Checklist
-
-- [ ] Open My Catalog → Pending tab with pending products → Quick Review popup auto-opens
-- [ ] Counter shows correct "1/N" format
-- [ ] Product image, name, and badge display correctly
-- [ ] Tap **Yes** → product counter advances, next product shows
-- [ ] Tap **No** → product counter advances, next product shows
-- [ ] Tap **✕ (close)** midway → loader shows → products processed in batch → success toast → pending list updates
-- [ ] Review all products (reach end) → auto-commits → same behavior as closing
-- [ ] After commit: products marked Yes appear in **Unavailable** tab
-- [ ] After commit: products marked No are removed entirely from all tabs
-- [ ] Open Pending tab with **no** pending products → popup does NOT open
-- [ ] Existing product-card click behavior (cross button, card click) still works unchanged
-- [ ] Pull-to-refresh still works
-- [ ] Switching between category tabs (All, Grocery, etc.) while on Pending recalculates correctly
-- [ ] If API call fails → error toast shown, catalog refreshes from backend
-- [ ] Popup does NOT reopen after committing (loop guard works)
+### Testing Frontend Display Modes
+1. **Mock a Registered Shop**
+   - Ensure the mocked `retailerCatalog` contains some products that exist in the geo-catalog and some that don't.
+   - **Verification**: In your UI, the matched items should appear at the top of the list with the "🔥 Local Favorite" badge, and the remaining products should appear directly beneath them.
+   
+2. **Mock an Unregistered Google Shop**
+   - Pass `isRegistered: false` and `pincode: "560100"`.
+   - **Verification**: The UI should display the catalog purely based on the Geo-Catalog. Items from `trending` will show the "📈 Nearby Trending" badge, and items from `popular` will show the "⭐ Highly Popular" badge.
