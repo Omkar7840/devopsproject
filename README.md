@@ -1312,46 +1312,51 @@ const getGeoCatalogWithFallback = async ({
   try {
     /* -------- STEP 1: FETCH GEO CATALOG -------- */
 
+    /* -------- STEP 1: FETCH GEO CATALOG (SMART FALLBACK) -------- */
+
     let geoCatalog = null;
 
+    // 1) Exact PINCODE
     if (pincode) {
       geoCatalog = await GeoCatalog.findOne({
         level: 'PINCODE',
         pincode: String(pincode),
       })
-        .sort({ updatedAt: -1 })
+        .sort({ updatedAt: -1, lastBuildAt: -1 })
         .lean();
     }
 
+    // 2) CITY → pick best PINCODE doc in same city
     if (!geoCatalog && city) {
       geoCatalog = await GeoCatalog.findOne({
-        level: 'CITY',
-        city,
+        level: 'PINCODE',
+        city: city,
       })
-        .sort({ updatedAt: -1 })
+        .sort({ updatedAt: -1, lastBuildAt: -1 })
         .lean();
     }
 
+    // 3) STATE → pick best PINCODE doc in same state
     if (!geoCatalog && state) {
       geoCatalog = await GeoCatalog.findOne({
-        level: 'STATE',
-        state,
+        level: 'PINCODE',
+        state: state,
       })
-        .sort({ updatedAt: -1 })
+        .sort({ updatedAt: -1, lastBuildAt: -1 })
         .lean();
     }
 
+    // 4) COUNTRY (optional final fallback)
     if (!geoCatalog && country) {
       geoCatalog = await GeoCatalog.findOne({
         level: 'COUNTRY',
-        country,
+        country: country,
       })
-        .sort({ updatedAt: -1 })
+        .sort({ updatedAt: -1, lastBuildAt: -1 })
         .lean();
     }
 
     if (!geoCatalog) return null;
-
     /* -------- STEP 2: NO SHOP → RETURN RAW -------- */
 
     if (!shopId) return geoCatalog;
