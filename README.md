@@ -692,10 +692,8 @@ const RetailerCatalog = require('../../models/mongoCatalog/retailerSchema');
 
 /* ---------------- CACHE ---------------- */
 
-/**
- * Cache: shopId → pincode
- */
-const pincodeCache = new Map();
+// shopId → { pincode, city, state }
+const locationCache = new Map();
 
 /* ---------------- HELPERS ---------------- */
 
@@ -709,29 +707,58 @@ const normalizeShop = (doc) => {
 };
 
 /**
- * 🔥 ROBUST PINCODE EXTRACTOR (FIXED)
+ * Extract location safely from response
  */
-const extractPincode = (data = {}) => {
-  return (
+const extractLocation = (data = {}) => {
+  // ✅ BEST SOURCE (vendor)
+  const vendor = data?.vendor || {};
+
+  let pincode =
+    vendor?.pincode ||
     data?.shop?.location?.pincode ||
-    data?.location?.pincode ||
     data?.pincode ||
-    data?.vendor?.pincode ||
-    data?.address?.pincode ||
-    data?.shop?.pincode ||
-    null
-  );
+    null;
+
+  let city =
+    vendor?.city ||
+    null;
+
+  let state =
+    vendor?.state ||
+    null;
+
+  /* -------- FALLBACK FROM ADDRESS -------- */
+
+  if ((!city || !state) && data?.shop?.location?.address) {
+    const address = String(data.shop.location.address);
+
+    const parts = address.split(',').map((p) => p.trim());
+
+    if (!city && parts.length >= 2) {
+      city = parts[parts.length - 2]; // second last
+    }
+
+    if (!state && parts.length >= 1) {
+      state = parts[parts.length - 1]; // last
+    }
+  }
+
+  return {
+    pincode: pincode ? String(pincode) : null,
+    city: city || null,
+    state: state || null,
+  };
 };
 
 /**
- * Fetch pincode from URL (ONLY ONCE)
+ * Fetch location from URL (with caching)
  */
-const fetchPincodeFromURL = async (shopId, url) => {
+const fetchLocationFromURL = async (shopId, url) => {
   if (!url) return null;
 
-  // ✅ Check cache
-  if (pincodeCache.has(shopId)) {
-    return pincodeCache.get(shopId);
+  // ✅ CACHE HIT
+  if (locationCache.has(shopId)) {
+    return locationCache.get(shopId);
   }
 
   try {
@@ -741,18 +768,14 @@ const fetchPincodeFromURL = async (shopId, url) => {
 
     const data = response?.data || {};
 
-    const pincode = extractPincode(data);
+    const location = extractLocation(data);
 
-   // console.log('👉 Extracted pincode:', pincode);
-
-    const finalPincode = pincode ? String(pincode) : null;
-
-    // ✅ Only cache VALID pincodes
-    if (finalPincode) {
-      pincodeCache.set(shopId, finalPincode);
+    // Only cache if pincode exists
+    if (location?.pincode) {
+      locationCache.set(shopId, location);
     }
 
-    return finalPincode;
+    return location;
   } catch (error) {
     log.warn({
       warn: 'Failed to fetch shop profile',
@@ -768,7 +791,7 @@ const fetchPincodeFromURL = async (shopId, url) => {
 /* ---------------- CORE FUNCTIONS ---------------- */
 
 /**
- * Get all unique shops (shopId + url)
+ * Get all unique shops
  */
 const getAllShops = async () => {
   const docs = await RetailerCatalog.find(
@@ -778,8 +801,6 @@ const getAllShops = async () => {
     },
     { shopId: 1, url: 1 }
   ).lean();
-
- // console.log('👉 Total retailer docs:', docs.length);
 
   const map = new Map();
 
@@ -792,15 +813,11 @@ const getAllShops = async () => {
     }
   });
 
-  const shops = Array.from(map.values());
-
-  // console.log('👉 Unique shops:', shops.length);
-
-  return shops;
+  return Array.from(map.values());
 };
 
 /**
- * Get all shop locations (shopId → pincode)
+ * Get all shop locations (ENRICHED)
  */
 const getAllShopLocations = async () => {
   const shops = await getAllShops();
@@ -810,36 +827,37 @@ const getAllShopLocations = async () => {
 
   for (const shop of shops) {
     try {
-      let pincode;
+      let location;
 
-      if (pincodeCache.has(shop.shopId)) {
-        pincode = pincodeCache.get(shop.shopId);
+      if (locationCache.has(shop.shopId)) {
+        location = locationCache.get(shop.shopId);
       } else {
-        pincode = await fetchPincodeFromURL(
+        location = await fetchLocationFromURL(
           shop.shopId,
           shop.url
         );
       }
 
-      if (pincode) {
+      if (location?.pincode) {
         results.push({
           shopId: shop.shopId,
-          pincode,
+          pincode: location.pincode,
+          city: location.city,
+          state: location.state,
         });
       }
     } catch (error) {
       fetchErrors++;
       log.warn({
-        warn: `[GEO] Failed to get pincode for shopId ${shop.shopId} — skipping`,
+        warn: `[GEO] Failed location for shopId ${shop.shopId}`,
         error: error.message,
       });
-      // Continue to the next shop — don't get stuck
     }
   }
 
   if (fetchErrors > 0) {
     log.warn({
-      warn: `[GEO] ${fetchErrors} shops failed pincode fetch out of ${shops.length} total`,
+      warn: `[GEO] ${fetchErrors} shops failed location fetch`,
     });
   }
 
@@ -847,7 +865,7 @@ const getAllShopLocations = async () => {
 };
 
 /**
- * Get shops by pincode
+ * Get shops by pincode (ENRICHED)
  */
 const getShopsByPincode = async (targetPincode) => {
   const normalized = String(targetPincode);
@@ -873,12 +891,12 @@ const getShopLocation = async (shopId) => {
 
   if (!shop) return null;
 
-  let pincode;
+  let location;
 
-  if (pincodeCache.has(shop.shopId)) {
-    pincode = pincodeCache.get(shop.shopId);
+  if (locationCache.has(shop.shopId)) {
+    location = locationCache.get(shop.shopId);
   } else {
-    pincode = await fetchPincodeFromURL(
+    location = await fetchLocationFromURL(
       shop.shopId,
       shop.url
     );
@@ -886,7 +904,9 @@ const getShopLocation = async (shopId) => {
 
   return {
     shopId: shop.shopId,
-    pincode,
+    pincode: location?.pincode || null,
+    city: location?.city || null,
+    state: location?.state || null,
   };
 };
 
