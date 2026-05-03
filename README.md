@@ -1187,10 +1187,10 @@ What this code does:
 
 ```js
 const { Logger: log } = require('sarvm-utility');
+const stringSimilarity = require('string-similarity');
 
 const GeoCatalog = require('../../models/mongoCatalog/geoCatalogSchema');
 const RetailerCatalog = require('../../models/mongoCatalog/retailerSchema');
-
 const { getMasterCatalogSet } = require('./masterCatalog.service');
 
 /* ---------------- HELPERS ---------------- */
@@ -1206,6 +1206,23 @@ const normalizeCategory = (str = '') =>
     .toLowerCase()
     .replace(/\s+/g, '_')
     .trim();
+
+/* ---------------- FUZZY MATCH ---------------- */
+
+const getBestMatch = (target, candidates, threshold) => {
+  if (!candidates.length) return null;
+
+  const names = candidates.map((c) => c.name);
+
+  const { bestMatch, bestMatchIndex } =
+    stringSimilarity.findBestMatch(target, names);
+
+  if (bestMatch.rating >= threshold) {
+    return candidates[bestMatchIndex];
+  }
+
+  return null;
+};
 
 /* ---------------- BUILD SHOP CATEGORY MAP ---------------- */
 
@@ -1249,55 +1266,84 @@ const filterGeoProducts = (geoProducts = [], masterSet) => {
 
 /* ---------------- MERGE LOGIC ---------------- */
 
-const mergeCategoryProducts = (shopProducts = [], geoProducts = []) => {
-  const geoMap = new Map();
-  const used = new Set();
+const mergeCategoryProducts = (shopProducts = [], geoSections = {}) => {
+  const trending = geoSections.trending || [];
+  const popular = geoSections.popular || [];
 
-  geoProducts.forEach((p) => {
-    geoMap.set(normalize(p.name), p);
-  });
+  const usedRetailer = new Set();
 
-  const common = [];
-  const shopOnly = [];
-  const geoOnly = [];
+  const matched = [];
+  const retailerOnly = [];
 
-  /* -------- COMMON + SHOP -------- */
+  /* -------- STEP 1: TRENDING (priority) -------- */
+
+  for (const geoProduct of trending) {
+    const match = getBestMatch(
+      geoProduct.name,
+      shopProducts,
+      0.5
+    );
+
+    if (match) {
+      const key = normalize(match.name);
+
+      if (!usedRetailer.has(key)) {
+        matched.push({
+          ...match,
+          source: 'TRENDING_MATCH',
+          isCommon: true,
+        });
+
+        usedRetailer.add(key);
+      }
+    }
+  }
+
+  /* -------- STEP 2: POPULAR (AI) -------- */
+
+  for (const geoProduct of popular) {
+    const match = getBestMatch(
+      geoProduct.name,
+      shopProducts,
+      0.4
+    );
+
+    if (match) {
+      const key = normalize(match.name);
+
+      if (!usedRetailer.has(key)) {
+        matched.push({
+          ...match,
+          source: 'POPULAR_MATCH',
+          isCommon: true,
+        });
+
+        usedRetailer.add(key);
+      }
+    }
+  }
+
+  /* -------- STEP 3: REMAINING RETAILER -------- */
 
   for (const shopProduct of shopProducts) {
-    const norm = normalize(shopProduct.name);
+    const key = normalize(shopProduct.name);
 
-    if (geoMap.has(norm)) {
-      const geoMatch = geoMap.get(norm);
-
-      common.push({
-        ...geoMatch,
-        source: 'COMMON',
-      });
-
-      used.add(norm);
-    } else {
-      shopOnly.push({
+    if (!usedRetailer.has(key)) {
+      retailerOnly.push({
         name: shopProduct.name,
-        count: 0,
         source: 'SHOP',
+        isCommon: false,
       });
     }
   }
 
-  /* -------- GEO ONLY -------- */
-
-  for (const geoProduct of geoProducts) {
-    const norm = normalize(geoProduct.name);
-
-    if (!used.has(norm)) {
-      geoOnly.push({
-        ...geoProduct,
-        source: 'GEO',
-      });
-    }
-  }
-
-  return [...common, ...shopOnly, ...geoOnly];
+  return {
+    finalProducts: [...matched, ...retailerOnly],
+    debug: {
+      common: matched,
+      retailer: retailerOnly,
+    },
+  };
 };
 
 /* ---------------- MAIN FUNCTION ---------------- */
@@ -1310,53 +1356,48 @@ const getGeoCatalogWithFallback = async ({
   country,
 }) => {
   try {
-    /* -------- STEP 1: FETCH GEO CATALOG -------- */
-
     /* -------- STEP 1: FETCH GEO CATALOG (SMART FALLBACK) -------- */
 
     let geoCatalog = null;
 
-    // 1) Exact PINCODE
     if (pincode) {
       geoCatalog = await GeoCatalog.findOne({
         level: 'PINCODE',
         pincode: String(pincode),
       })
-        .sort({ updatedAt: -1, lastBuildAt: -1 })
+        .sort({ updatedAt: -1 })
         .lean();
     }
 
-    // 2) CITY → pick best PINCODE doc in same city
     if (!geoCatalog && city) {
       geoCatalog = await GeoCatalog.findOne({
         level: 'PINCODE',
-        city: city,
+        city,
       })
-        .sort({ updatedAt: -1, lastBuildAt: -1 })
+        .sort({ updatedAt: -1 })
         .lean();
     }
 
-    // 3) STATE → pick best PINCODE doc in same state
     if (!geoCatalog && state) {
       geoCatalog = await GeoCatalog.findOne({
         level: 'PINCODE',
-        state: state,
+        state,
       })
-        .sort({ updatedAt: -1, lastBuildAt: -1 })
+        .sort({ updatedAt: -1 })
         .lean();
     }
 
-    // 4) COUNTRY (optional final fallback)
     if (!geoCatalog && country) {
       geoCatalog = await GeoCatalog.findOne({
         level: 'COUNTRY',
-        country: country,
+        country,
       })
-        .sort({ updatedAt: -1, lastBuildAt: -1 })
+        .sort({ updatedAt: -1 })
         .lean();
     }
 
     if (!geoCatalog) return null;
+
     /* -------- STEP 2: NO SHOP → RETURN RAW -------- */
 
     if (!shopId) return geoCatalog;
@@ -1385,34 +1426,29 @@ const getGeoCatalogWithFallback = async ({
     geoCatalog.categories.forEach((geoCategory) => {
       const categoryName = normalizeCategory(geoCategory.name);
 
-      // Only include categories present in shop
       if (!shopCategoryMap.has(categoryName)) return;
 
       const shopProducts = shopCategoryMap.get(categoryName);
 
-      // 🔥 FLATTEN SECTIONS (IMPORTANT CHANGE)
       const geoProducts = [
         ...(geoCategory.sections?.trending || []),
         ...(geoCategory.sections?.popular || []),
       ];
-
-      /* -------- FILTER -------- */
 
       const filteredGeoProducts = filterGeoProducts(
         geoProducts,
         masterSet
       );
 
-      /* -------- MERGE -------- */
-
-      const mergedProducts = mergeCategoryProducts(
+      const { finalProducts, debug } = mergeCategoryProducts(
         shopProducts,
-        filteredGeoProducts
+        geoCategory.sections
       );
 
       finalCategories.push({
         name: geoCategory.name,
-        products: mergedProducts, // 👈 stays flat for shop use
+        products: finalProducts,
+        debug, // 👈 visible in API for testing
       });
     });
 
