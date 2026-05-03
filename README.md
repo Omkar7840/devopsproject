@@ -145,6 +145,8 @@ What this code does:
 ```js
 const mongoose = require('mongoose');
 
+/* ---------------- PRODUCT SCHEMA ---------------- */
+
 const geoCatalogProductSchema = new mongoose.Schema(
   {
     name: {
@@ -163,12 +165,14 @@ const geoCatalogProductSchema = new mongoose.Schema(
     },
     source: {
       type: String,
-      enum: ['DB', 'AI', 'FALLBACK'],
+      enum: ['DB', 'AI'],
       default: 'DB',
     },
   },
-  { _id: false },
+  { _id: false }
 );
+
+/* ---------------- CATEGORY SCHEMA ---------------- */
 
 const geoCatalogCategorySchema = new mongoose.Schema(
   {
@@ -177,13 +181,23 @@ const geoCatalogCategorySchema = new mongoose.Schema(
       required: true,
       trim: true,
     },
-    products: {
-      type: [geoCatalogProductSchema],
-      default: [],
+
+    // 🔥 NEW STRUCTURE (IMPORTANT CHANGE)
+    sections: {
+      trending: {
+        type: [geoCatalogProductSchema], // DB products
+        default: [],
+      },
+      popular: {
+        type: [geoCatalogProductSchema], // AI products
+        default: [],
+      },
     },
   },
-  { _id: false },
+  { _id: false }
 );
+
+/* ---------------- MAIN GEO SCHEMA ---------------- */
 
 const geoCatalogSchema = new mongoose.Schema(
   {
@@ -192,44 +206,57 @@ const geoCatalogSchema = new mongoose.Schema(
       required: true,
       enum: ['PINCODE', 'CITY', 'STATE', 'COUNTRY'],
     },
+
     pincode: {
       type: String,
       default: null,
       index: true,
     },
+
     city: {
       type: String,
       default: null,
     },
+
+    // ✅ NEW FIELD (as you requested)
     state: {
       type: String,
       default: null,
     },
+
     country: {
       type: String,
       default: null,
     },
+
     categories: {
       type: [geoCatalogCategorySchema],
       default: [],
     },
+
     lastBuildAt: {
       type: Date,
       default: null,
     },
+
     buildStatus: {
       type: String,
-      enum: ['SUCCESS', 'PARTIAL', 'FALLBACK', 'FAILED'],
+      enum: ['SUCCESS', 'PARTIAL', 'FAILED'],
       default: 'SUCCESS',
     },
   },
-  { timestamps: true },
+  { timestamps: true }
 );
 
+/* ---------------- INDEXES ---------------- */
+
+// Efficient lookups by hierarchy level
 geoCatalogSchema.index({ level: 1, pincode: 1 }, { sparse: true });
 geoCatalogSchema.index({ level: 1, city: 1 }, { sparse: true });
 geoCatalogSchema.index({ level: 1, state: 1 }, { sparse: true });
 geoCatalogSchema.index({ level: 1, country: 1 }, { sparse: true });
+
+/* ---------------- MODEL ---------------- */
 
 const GeoCatalog = mongoose.model('geo_catalogs', geoCatalogSchema);
 
@@ -924,7 +951,6 @@ const normalizeCategory = (str = '') =>
   String(str)
     .toLowerCase()
     .replace(/\s+/g, '_')
-    .replace(/&/g, '&')
     .trim();
 
 const normalizeName = (str = '') =>
@@ -932,99 +958,31 @@ const normalizeName = (str = '') =>
     .toLowerCase()
     .replace(/[^a-z0-9]/g, '');
 
-const createRequestsForMissingMasterProducts = async ({
-  products = [],
-  categoryName,
-  pincode,
-}) => {
-  let createdCount = 0;
-
-  try {
-    const seenProductNames = new Set();
-
-    for (const product of products) {
-      const productName = product?.name;
-
-      if (!productName || seenProductNames.has(productName)) continue;
-
-      seenProductNames.add(productName);
-
-      const existingMasterProduct = await Product.exists({
-        prdNm: productName,
-      });
-
-      if (existingMasterProduct) continue;
-
-      const result = await ReqMasterProductService.createGeoCatalogRequestIfMissing({
-        productName,
-        category: categoryName,
-      });
-
-      if (result.created) {
-        createdCount++;
-      }
-    }
-
-    if (createdCount > 0) {
-      log.info({
-        info: `[CRON] Pincode ${pincode} - created ${createdCount} geo_catalog product request(s) for ${categoryName}`,
-      });
-    }
-  } catch (error) {
-    log.error({
-      error: `[CRON] Pincode ${pincode} - failed to create geo_catalog product request(s)`,
-      details: error.message,
-    });
-  }
-};
+const TEST_NAME_PATTERN = /^test/i;
 
 /* ---------------- MASTER CATEGORY FETCH ---------------- */
-
-const TEST_NAME_PATTERN = /^test/i;
 
 const getMasterCategories = async () => {
   const allCategories = await Catalog.find()
     .select('name dummyKey')
     .lean();
 
-  const valid = allCategories.filter((cat) => {
-    // Skip if name or dummyKey is missing
-    if (!cat.name || !cat.dummyKey) return false;
-
-    // Skip test documents
-    if (TEST_NAME_PATTERN.test(cat.name.trim())) return false;
-
-    return true;
-  });
-
-  const skipped = allCategories.length - valid.length;
-
-  if (skipped > 0) {
-    log.warn({
-      warn: `[CRON] Skipped ${skipped} categories (null name/key or test documents)`,
-    });
-  }
-
-  return valid.map((cat) => ({
-    name: cat.name,
-    key: cat.dummyKey,
-  }));
+  return allCategories
+    .filter((cat) => cat.name && cat.dummyKey && !TEST_NAME_PATTERN.test(cat.name))
+    .map((cat) => ({
+      name: cat.name,
+      key: cat.dummyKey,
+    }));
 };
 
-/* ---------------- GET CATEGORY FROM RETAILER ---------------- */
+/* ---------------- CATEGORY FROM RETAILER ---------------- */
 
 const getCategoryKeyFromDoc = (doc) => {
-  const raw =
-    doc?.category ||
-    doc?.catalog?.catPnm ||
-    '';
-
-  const first = String(raw).split('/')[0];
-
-  return normalizeCategory(first);
+  const raw = doc?.category || doc?.catalog?.catPnm || '';
+  return normalizeCategory(String(raw).split('/')[0]);
 };
 
-/* ---------------- BUILD RETAILER CATEGORY MAP ---------------- */
+/* ---------------- BUILD CATEGORY MAP ---------------- */
 
 const buildRetailerCategoryMap = (retailerDocs = []) => {
   const categoryMap = new Map();
@@ -1040,14 +998,13 @@ const buildRetailerCategoryMap = (retailerDocs = []) => {
     }
 
     const productMap = categoryMap.get(categoryKey);
-
     productMap[name] = (productMap[name] || 0) + 1;
   });
 
   const finalMap = new Map();
 
   for (const [category, products] of categoryMap.entries()) {
-    const sortedProducts = Object.entries(products)
+    const sorted = Object.entries(products)
       .map(([name, count]) => ({
         name,
         count,
@@ -1055,7 +1012,7 @@ const buildRetailerCategoryMap = (retailerDocs = []) => {
       }))
       .sort((a, b) => b.count - a.count);
 
-    finalMap.set(category, sortedProducts);
+    finalMap.set(category, sorted);
   }
 
   return finalMap;
@@ -1067,11 +1024,9 @@ const buildPincodeCatalog = async (pincode) => {
   const normalizedPincode = String(pincode);
 
   /* -------- STEP 1: MASTER CATEGORIES -------- */
-
   const masterCategories = await getMasterCategories();
 
   /* -------- STEP 2: SHOPS -------- */
-
   const shops = await shopGeoService.getShopsByPincode(normalizedPincode);
   const shopIds = shops.map((s) => Number(s.shopId)).filter(Boolean);
 
@@ -1082,7 +1037,6 @@ const buildPincodeCatalog = async (pincode) => {
   let retailerCategoryMap = new Map();
 
   /* -------- STEP 3: RETAILER DATA -------- */
-
   if (shopIds.length) {
     const retailerDocs = await RetailerCatalog.find({
       shopId: { $in: shopIds },
@@ -1090,16 +1044,11 @@ const buildPincodeCatalog = async (pincode) => {
     }).lean();
 
     retailerCategoryMap = buildRetailerCategoryMap(retailerDocs);
-  } else {
-    log.warn({
-      warn: `[CRON] Pincode ${normalizedPincode} — no shops found`,
-    });
   }
 
-  /* -------- STEP 4: BUILD FINAL OUTPUT -------- */
+  /* -------- STEP 4: BUILD OUTPUT -------- */
 
   const finalCategories = [];
-  const aiFailures = []; // 🔥 Collect failures instead of logging each one
 
   for (const category of masterCategories) {
     const categoryKey = category.key;
@@ -1107,48 +1056,45 @@ const buildPincodeCatalog = async (pincode) => {
 
     const dbProducts = retailerCategoryMap.get(categoryKey) || [];
 
-    const finalList = [];
+    // 🔥 NEW STRUCTURE
+    const trending = []; // DB
+    const popular = [];  // AI
+
     const usedNames = new Set();
 
-    /* -------- ADD DB PRODUCTS -------- */
+    /* -------- DB → TRENDING -------- */
 
     for (const p of dbProducts) {
       const clean = exactProductName(p.name);
       const norm = normalizeName(clean);
 
       if (!usedNames.has(norm)) {
-        finalList.push({
+        trending.push({
           name: clean,
           count: p.count,
           source: 'DB',
         });
+
         usedNames.add(norm);
       }
 
-      if (finalList.length >= DB_LIMIT) break;
+      if (trending.length >= DB_LIMIT) break;
     }
 
     /* -------- AI GENERATION -------- */
 
     let aiProducts = [];
-    let aiStatus = 'PENDING';
 
     try {
       aiProducts = await aiService.getCategoryProducts(
         categoryKey,
         dbProducts.map((p) => p.name)
       );
-
-      aiStatus = 'DONE';
     } catch (err) {
-      aiStatus = 'FAILED';
-      aiFailures.push(categoryName); // 🔥 Track failure silently
       aiProducts = [];
     }
 
-    /* -------- ADD AI PRODUCTS -------- */
-
-    let aiAdded = 0;
+    /* -------- AI → POPULAR -------- */
 
     for (const name of aiProducts) {
       const clean = exactProductName(name);
@@ -1156,40 +1102,25 @@ const buildPincodeCatalog = async (pincode) => {
 
       if (usedNames.has(norm)) continue;
 
-      finalList.push({
+      popular.push({
         name: clean,
         count: 0,
         source: 'AI',
       });
 
       usedNames.add(norm);
-      aiAdded++;
 
-      if (aiAdded >= AI_LIMIT) break;
+      if (popular.length >= AI_LIMIT) break;
     }
 
     /* -------- FINAL CATEGORY -------- */
-    /* Always include every category — even with 0 products —
-       so the retry cron can pick up FAILED ones later */
-
-    await createRequestsForMissingMasterProducts({
-      products: finalList,
-      categoryName,
-      pincode: normalizedPincode,
-    });
 
     finalCategories.push({
       name: categoryName,
-      products: finalList,
-      aiStatus,
-    });
-  }
-
-  /* -------- LOG AI FAILURES AT PINCODE LEVEL -------- */
-
-  if (aiFailures.length > 0) {
-    log.warn({
-      warn: `[CRON] Pincode ${normalizedPincode} — AI generation failed for ${aiFailures.length}/${masterCategories.length} categories`,
+      sections: {
+        trending,
+        popular,
+      },
     });
   }
 
@@ -1203,17 +1134,11 @@ const buildPincodeCatalog = async (pincode) => {
         pincode: normalizedPincode,
         categories: finalCategories,
         lastBuildAt: new Date(),
-        buildStatus: aiFailures.length === 0
-          ? 'SUCCESS'
-          : aiFailures.length < masterCategories.length
-            ? 'PARTIAL'
-            : 'FAILED',
+        buildStatus: 'SUCCESS',
       },
     },
     { upsert: true, new: true }
   );
-
-
 
   return {
     success: true,
@@ -1246,7 +1171,6 @@ const { Logger: log } = require('sarvm-utility');
 const GeoCatalog = require('../../models/mongoCatalog/geoCatalogSchema');
 const RetailerCatalog = require('../../models/mongoCatalog/retailerSchema');
 
-const shopGeoService = require('./shopGeo.service');
 const { getMasterCatalogSet } = require('./masterCatalog.service');
 
 /* ---------------- HELPERS ---------------- */
@@ -1263,9 +1187,8 @@ const normalizeCategory = (str = '') =>
     .replace(/\s+/g, '_')
     .trim();
 
-/**
- * Build shop category map
- */
+/* ---------------- BUILD SHOP CATEGORY MAP ---------------- */
+
 const buildShopCategoryMap = (retailerDocs = []) => {
   const map = new Map();
 
@@ -1296,22 +1219,16 @@ const buildShopCategoryMap = (retailerDocs = []) => {
   return map;
 };
 
-/**
- * 🔥 FILTER GEO PRODUCTS USING MASTER CATALOG
- */
+/* ---------------- FILTER GEO PRODUCTS ---------------- */
+
 const filterGeoProducts = (geoProducts = [], masterSet) => {
   return geoProducts.filter((p) =>
     masterSet.has(normalize(p.name))
   );
 };
 
-/**
- * 🔥 CORE MERGE LOGIC
- *
- * 1. COMMON
- * 2. RETAILER
- * 3. GEO
- */
+/* ---------------- MERGE LOGIC ---------------- */
+
 const mergeCategoryProducts = (shopProducts = [], geoProducts = []) => {
   const geoMap = new Map();
   const used = new Set();
@@ -1324,7 +1241,7 @@ const mergeCategoryProducts = (shopProducts = [], geoProducts = []) => {
   const shopOnly = [];
   const geoOnly = [];
 
-  /* -------- STEP 1: COMMON + SHOP -------- */
+  /* -------- COMMON + SHOP -------- */
 
   for (const shopProduct of shopProducts) {
     const norm = normalize(shopProduct.name);
@@ -1347,7 +1264,7 @@ const mergeCategoryProducts = (shopProducts = [], geoProducts = []) => {
     }
   }
 
-  /* -------- STEP 2: GEO ONLY -------- */
+  /* -------- GEO ONLY -------- */
 
   for (const geoProduct of geoProducts) {
     const norm = normalize(geoProduct.name);
@@ -1415,11 +1332,11 @@ const getGeoCatalogWithFallback = async ({
 
     if (!geoCatalog) return null;
 
-    /* -------- STEP 2: IF NO SHOP → RETURN RAW -------- */
+    /* -------- STEP 2: NO SHOP → RETURN RAW -------- */
 
     if (!shopId) return geoCatalog;
 
-    /* -------- STEP 3: GET MASTER CATALOG -------- */
+    /* -------- STEP 3: MASTER CATALOG -------- */
 
     const masterSet = await getMasterCatalogSet();
 
@@ -1436,27 +1353,32 @@ const getGeoCatalogWithFallback = async ({
 
     const shopCategoryMap = buildShopCategoryMap(retailerDocs);
 
-    /* -------- STEP 5: CATEGORY-WISE PROCESS -------- */
+    /* -------- STEP 5: PROCESS CATEGORY -------- */
 
     const finalCategories = [];
 
     geoCatalog.categories.forEach((geoCategory) => {
       const categoryName = normalizeCategory(geoCategory.name);
 
-      // ❗ Only include categories present in shop
+      // Only include categories present in shop
       if (!shopCategoryMap.has(categoryName)) return;
 
       const shopProducts = shopCategoryMap.get(categoryName);
-      const geoProducts = geoCategory.products || [];
 
-      /* -------- 🔥 FILTER GEO PRODUCTS -------- */
+      // 🔥 FLATTEN SECTIONS (IMPORTANT CHANGE)
+      const geoProducts = [
+        ...(geoCategory.sections?.trending || []),
+        ...(geoCategory.sections?.popular || []),
+      ];
+
+      /* -------- FILTER -------- */
 
       const filteredGeoProducts = filterGeoProducts(
         geoProducts,
         masterSet
       );
 
-      /* -------- 🔥 MERGE -------- */
+      /* -------- MERGE -------- */
 
       const mergedProducts = mergeCategoryProducts(
         shopProducts,
@@ -1465,7 +1387,7 @@ const getGeoCatalogWithFallback = async ({
 
       finalCategories.push({
         name: geoCategory.name,
-        products: mergedProducts,
+        products: mergedProducts, // 👈 stays flat for shop use
       });
     });
 
@@ -1504,12 +1426,22 @@ const { Logger: log } = require('sarvm-utility');
 
 const { buildPincodeCatalog } = require('../../services/v1/pincodeCatalogBuilder.service');
 const {
-  applyGeoCatalogToShop,
   getGeoCatalogWithFallback,
 } = require('../../services/v1/geoHierarchy.service');
 
 const shopGeoService = require('../../services/v1/shopGeo.service');
 const { runGeoCatalogJobOnce } = require('../../../jobs/geoCatalog.job');
+
+/* ---------------- HELPER: COUNT PRODUCTS ---------------- */
+
+const getTotalProducts = (categories = []) => {
+  return categories.reduce((count, cat) => {
+    const trending = cat.sections?.trending || [];
+    const popular = cat.sections?.popular || [];
+
+    return count + trending.length + popular.length;
+  }, 0);
+};
 
 /* ---------------- TEST PINCODE ---------------- */
 
@@ -1530,10 +1462,7 @@ const testPincodeCatalog = async (req, res) => {
       success: true,
       pincode: String(pincode),
       categoryCount: result.categories.length,
-      totalProducts: result.categories.reduce(
-        (c, cat) => c + (cat.products || []).length,
-        0
-      ),
+      totalProducts: getTotalProducts(result.categories),
       categories: result.categories,
     });
   } catch (error) {
@@ -1578,47 +1507,12 @@ const testShopCatalog = async (req, res) => {
       shopId: Number(shopId),
       pincode: location.pincode,
       categoryCount: result.categories.length,
-      totalProducts: result.categories.reduce(
-        (c, cat) => c + (cat.products || []).length,
-        0
-      ),
+      totalProducts: getTotalProducts(result.categories),
       categories: result.categories,
     });
   } catch (error) {
     log.error({
       error: 'Error in testShopCatalog',
-      details: error.message,
-    });
-
-    return res.status(500).json({
-      success: false,
-      message: 'Internal server error',
-    });
-  }
-};
-
-/* ---------------- APPLY GEO CATALOG ---------------- */
-
-const applyGeoCatalog = async (req, res) => {
-  try {
-    const { shopId, pincode } = req.body;
-
-    if (!shopId) {
-      return res.status(400).json({
-        success: false,
-        message: 'shopId is required',
-      });
-    }
-
-    const result = await applyGeoCatalogToShop({
-      shopId,
-      pincode,
-    });
-
-    return res.status(200).json(result);
-  } catch (error) {
-    log.error({
-      error: 'Error in applyGeoCatalog',
       details: error.message,
     });
 
@@ -1671,13 +1565,12 @@ const getResolvedGeoCatalog = async (req, res) => {
   }
 };
 
-/* ---------------- 🔥 MANUAL CRON TRIGGER ---------------- */
+/* ---------------- MANUAL CRON TRIGGER ---------------- */
 
 const triggerCronManually = async (req, res) => {
   try {
     log.info({ info: 'Manual geo cron trigger started' });
 
-    // Run async (non-blocking)
     runGeoCatalogJobOnce();
 
     return res.status(202).json({
@@ -1702,9 +1595,8 @@ const triggerCronManually = async (req, res) => {
 module.exports = {
   testPincodeCatalog,
   testShopCatalog,
-  applyGeoCatalog,
   getResolvedGeoCatalog,
-  triggerCronManually, // 🔥 IMPORTANT
+  triggerCronManually,
 };
 ```
 
